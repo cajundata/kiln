@@ -1,0 +1,5 @@
+version: 1
+tasks:
+  - id: "exec-01"
+    prompt: ".kiln/prompts/tasks/exec-01.md"
+    needs: []
