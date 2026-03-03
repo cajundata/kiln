@@ -1,5 +1,40 @@
-version: 1
-tasks:
-  - id: "exec-01"
-    prompt: ".kiln/prompts/tasks/exec-01.md"
-    needs: []
+- id: exec-timeout
+  prompt: .kiln/prompts/tasks/exec-timeout.md
+  needs: []
+
+- id: exec-retry
+  prompt: .kiln/prompts/tasks/exec-retry.md
+  needs:
+    - exec-timeout
+
+- id: exec-footer
+  prompt: .kiln/prompts/tasks/exec-footer.md
+  needs:
+    - exec-retry
+
+- id: exec-logging
+  prompt: .kiln/prompts/tasks/exec-logging.md
+  needs:
+    - exec-retry
+
+- id: validate-schema
+  prompt: .kiln/prompts/tasks/validate-schema.md
+  needs: []
+
+- id: validate-cycles
+  prompt: .kiln/prompts/tasks/validate-cycles.md
+  needs:
+    - validate-schema
+
+- id: gen-make
+  prompt: .kiln/prompts/tasks/gen-make.md
+  needs:
+    - validate-cycles
+
+- id: makefile-setup
+  prompt: .kiln/prompts/tasks/makefile-setup.md
+  needs: []
+
+- id: prompt-extract-tasks
+  prompt: .kiln/prompts/tasks/prompt-extract-tasks.md
+  needs: []

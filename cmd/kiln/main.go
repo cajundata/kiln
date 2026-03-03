@@ -38,7 +38,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 // commandBuilder creates an *exec.Cmd for the claude invocation.
 // Swappable in tests to avoid calling the real claude binary.
 var commandBuilder = func(prompt string) *exec.Cmd {
-	return exec.Command("claude", "--output-format", "stream-json", "-p", prompt)
+	return exec.Command("claude", "--dangerously-skip-permissions", "--verbose", "--output-format", "stream-json", "-p", prompt)
 }
 
 func runExec(args []string, stdout io.Writer) error {
