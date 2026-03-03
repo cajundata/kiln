@@ -17,6 +17,11 @@
   needs:
     - exec-retry
 
+- id: exec-model
+  prompt: .kiln/prompts/tasks/exec-model.md
+  needs:
+    - exec-retry
+
 - id: validate-schema
   prompt: .kiln/prompts/tasks/validate-schema.md
   needs: []
