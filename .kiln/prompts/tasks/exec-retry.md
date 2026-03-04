@@ -1,47 +1,81 @@
-# Task: Add retry with exponential backoff to kiln exec
+# Task: Implement retry behavior inside `kiln exec`
 
 ## Role
 
-You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Your job is to implement focused, minimal changes.
+You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Implement focused, minimal changes with tests.
 
 ---
 
 ## Context
 
-`kiln exec` can invoke the `claude` CLI with a `--timeout` flag. When a transient failure occurs (timeout, network error), we want automatic retries with exponential backoff and jitter.
+We want retry to exist inside kiln (not as shell glue). Today, timeouts and non-zero exits can happen, and we want an ergonomic way to retry a task execution with bounded attempts.
+
+This should work for:
+
+- `kiln exec --prompt-file ...`
+- `kiln exec --tasks ... --task-id ...`
 
 ---
 
 ## Requirements
 
-### 1. Add --max-retries flag
+### 1) CLI
 
-- Add a `--max-retries` flag (default: `3`).
-- Add a `--backoff` flag (default: `exponential`; only `exponential` is supported for MVP).
+Add flags to `kiln exec`:
 
-### 2. Retry logic
+- `--retries <n>` (default 0)
+- `--retry-backoff <duration>` (default 0; e.g., "250ms", "1s")
 
-- On transient failure (exit code `20` from timeout, or claude process returning non-zero), retry up to `--max-retries` times.
-- Use exponential backoff with jitter between retries.
-- Each retry attempt should be logged to `.kiln/logs/<task-id>.json`.
+Behavior:
 
-### 3. Exit codes after retries
+- On retryable failures, retry up to N times (total attempts = 1 + retries)
+- Sleep `retry-backoff` between attempts (constant backoff is fine for now)
 
-- If all retries are exhausted: exit `20`.
-- If any attempt succeeds: use the success exit code from that attempt.
+### 2) Retryable vs non-retryable
+
+Define retryable errors as:
+
+- timeout errors (your existing timeout error type)
+- claude invocation failed due to non-zero exit code
+
+Non-retryable errors include:
+
+- invalid flags / missing required args
+- unable to read prompt file / tasks file
+- YAML parse errors
+- task-id not found in tasks.yaml
+
+### 3) Logging
+
+Continue to write `.kiln/logs/<task-id>.json` as you do now, but include a small header line or log entry per attempt indicating attempt number (1..N).
+
+If you prefer to keep the log format untouched, you may instead write attempt notes to stderr, but tests should verify retries occurred.
+
+### 4) Done markers
+
+Only write `.kiln/done/<task-id>.done` if the final outcome is success.
+
+### 5) Exit codes
+
+- success: exit 0 (no change)
+- failures: preserve your existing exit code conventions (e.g., timeout exit code 20) if already implemented.
+- If retries exhausted, exit with the code that corresponds to the final failure type.
 
 ---
 
 ## Acceptance Criteria
 
-- A transient failure triggers automatic retries up to the configured limit.
-- Backoff increases exponentially between attempts.
-- Each attempt is logged.
-- Exit code `20` when all retries exhausted.
-- The code builds with `go build -o kiln ./cmd/kiln`.
+- `kiln exec ... --retries 2` performs up to 3 attempts for retryable failures.
+- Retries do not happen for non-retryable validation errors.
+- Done marker only exists after a successful execution.
+- Unit tests cover:
+  - retries on timeout
+  - retries on non-zero claude exit
+  - no retries on missing files / parse errors
+  - backoff respected (can be tested by injecting/simulating sleeper if needed)
 
 ---
 
 ## Final JSON Status Footer
 
-{"kiln":{"status":"complete","task_id":"exec-retry","notes":"added retry with exponential backoff and jitter"}}
+{"kiln":{"status":"complete","task_id":"exec-retry","notes":"Added retries/backoff to kiln exec for retryable failures; preserves logging and only writes done marker on success"}}
