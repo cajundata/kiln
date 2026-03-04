@@ -18,6 +18,9 @@ profile.cov
 # Dependency directories
 # vendor/
 
+# Logs
+.kiln/logs/
+
 # Go workspace file
 go.work
 go.work.sum

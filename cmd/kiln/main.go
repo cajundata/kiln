@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -120,6 +121,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "validate-schema":
+		if err := runValidateSchema(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "validate-schema: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1
@@ -135,23 +142,79 @@ type Task struct {
 	Model   string   `yaml:"model,omitempty"`
 }
 
-// loadTasks reads and parses a tasks.yaml file, returning the task list.
+// taskIDRegexp is the valid pattern for task IDs (kebab-case).
+var taskIDRegexp = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// loadTasks reads, parses, and validates a tasks.yaml file.
+// Unknown fields are rejected (strict schema).
 func loadTasks(path string) ([]Task, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tasks file: %w", err)
 	}
 
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
 	var tasks []Task
-	if err := yaml.Unmarshal(data, &tasks); err != nil {
-		return nil, fmt.Errorf("failed to parse tasks file: %w", err)
+	if decErr := dec.Decode(&tasks); decErr != nil {
+		if decErr == io.EOF {
+			return nil, fmt.Errorf("no tasks found in %s", path)
+		}
+		return nil, fmt.Errorf("failed to parse tasks file: %w", decErr)
 	}
 
 	if len(tasks) == 0 {
 		return nil, fmt.Errorf("no tasks found in %s", path)
 	}
 
+	seen := make(map[string]bool)
+	for i, t := range tasks {
+		if t.ID == "" {
+			return nil, fmt.Errorf("task at index %d: id is required", i)
+		}
+		if !taskIDRegexp.MatchString(t.ID) {
+			return nil, fmt.Errorf("task %q: id must be kebab-case", t.ID)
+		}
+		if seen[t.ID] {
+			return nil, fmt.Errorf("duplicate task id %q", t.ID)
+		}
+		seen[t.ID] = true
+		if t.Prompt == "" {
+			return nil, fmt.Errorf("task %q: prompt is required", t.ID)
+		}
+		if filepath.IsAbs(t.Prompt) {
+			return nil, fmt.Errorf("task %q: prompt must be a relative path, got %q", t.ID, t.Prompt)
+		}
+		for j, dep := range t.Needs {
+			if dep == "" {
+				return nil, fmt.Errorf("task %q: needs[%d] must not be empty", t.ID, j)
+			}
+		}
+	}
+
 	return tasks, nil
+}
+
+func runValidateSchema(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("validate-schema", flag.ContinueOnError)
+	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *tasksFile == "" {
+		return fmt.Errorf("--tasks is required")
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "validate-schema: OK (%d tasks)\n", len(tasks))
+	return nil
 }
 
 func runGenMake(args []string) error {

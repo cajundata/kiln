@@ -94,6 +94,196 @@ func TestLoadTasks_TaskWithModel(t *testing.T) {
 	}
 }
 
+// --- Additional loadTasks validation tests ---
+
+func TestLoadTasks_Validation(t *testing.T) {
+	writeFile := func(t *testing.T, content string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "tasks.yaml")
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	tests := []struct {
+		name        string
+		yaml        string
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name: "success without model",
+			yaml: "- id: foo\n  prompt: foo.md\n",
+		},
+		{
+			name: "success with model",
+			yaml: "- id: foo\n  prompt: foo.md\n  model: claude-haiku-4-5-20251001\n",
+		},
+		{
+			name:        "missing id",
+			yaml:        "- prompt: foo.md\n",
+			wantErr:     true,
+			errContains: "id is required",
+		},
+		{
+			name:        "empty id",
+			yaml:        "- id: \"\"\n  prompt: foo.md\n",
+			wantErr:     true,
+			errContains: "id is required",
+		},
+		{
+			name:        "missing prompt",
+			yaml:        "- id: foo\n",
+			wantErr:     true,
+			errContains: "prompt is required",
+		},
+		{
+			name:        "empty prompt",
+			yaml:        "- id: foo\n  prompt: \"\"\n",
+			wantErr:     true,
+			errContains: "prompt is required",
+		},
+		{
+			name:        "duplicate ids",
+			yaml:        "- id: foo\n  prompt: a.md\n- id: foo\n  prompt: b.md\n",
+			wantErr:     true,
+			errContains: "duplicate task id",
+		},
+		{
+			name:        "duplicate ids mentions id",
+			yaml:        "- id: my-task\n  prompt: a.md\n- id: my-task\n  prompt: b.md\n",
+			wantErr:     true,
+			errContains: "my-task",
+		},
+		{
+			name:        "absolute prompt path",
+			yaml:        "- id: foo\n  prompt: /absolute/path.md\n",
+			wantErr:     true,
+			errContains: "relative path",
+		},
+		{
+			name:        "empty needs element",
+			yaml:        "- id: foo\n  prompt: foo.md\n  needs:\n    - \"\"\n",
+			wantErr:     true,
+			errContains: "must not be empty",
+		},
+		{
+			name:        "needs wrong type (string instead of list)",
+			yaml:        "- id: foo\n  prompt: foo.md\n  needs: \"not-a-list\"\n",
+			wantErr:     true,
+			errContains: "failed to parse tasks file",
+		},
+		{
+			name:        "model wrong type (list instead of string)",
+			yaml:        "- id: foo\n  prompt: foo.md\n  model:\n    - a\n    - b\n",
+			wantErr:     true,
+			errContains: "failed to parse tasks file",
+		},
+		{
+			name:        "unknown field rejected",
+			yaml:        "- id: foo\n  prompt: foo.md\n  bogus: value\n",
+			wantErr:     true,
+			errContains: "failed to parse tasks file",
+		},
+		{
+			name:        "invalid id format (uppercase)",
+			yaml:        "- id: FooBar\n  prompt: foo.md\n",
+			wantErr:     true,
+			errContains: "kebab-case",
+		},
+		{
+			name:        "invalid id format (spaces)",
+			yaml:        "- id: \"foo bar\"\n  prompt: foo.md\n",
+			wantErr:     true,
+			errContains: "kebab-case",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := writeFile(t, tt.yaml)
+			tasks, err := loadTasks(p)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got tasks: %+v", tasks)
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Fatalf("expected error containing %q, got: %v", tt.errContains, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// --- Tests for validate-schema ---
+
+func TestRunValidateSchema_MissingTasksFlag(t *testing.T) {
+	var out bytes.Buffer
+	code := run([]string{"validate-schema"}, &out, &out)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing --tasks")
+	}
+	if !strings.Contains(out.String(), "--tasks is required") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestRunValidateSchema_InvalidYAML(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("not: valid: yaml: [[["), 0o644)
+
+	var out bytes.Buffer
+	code := run([]string{"validate-schema", "--tasks", p}, &out, &out)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for invalid YAML")
+	}
+	if !strings.Contains(out.String(), "failed to parse tasks file") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestRunValidateSchema_EmptyTasks(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("[]"), 0o644)
+
+	var out bytes.Buffer
+	code := run([]string{"validate-schema", "--tasks", p}, &out, &out)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for empty tasks")
+	}
+	if !strings.Contains(out.String(), "no tasks found") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestRunValidateSchema_Success(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: alpha
+  prompt: a.md
+- id: beta
+  prompt: b.md
+  needs:
+    - alpha
+`), 0o644)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"validate-schema", "--tasks", p}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "validate-schema: OK (2 tasks)") {
+		t.Fatalf("unexpected output: %s", stdout.String())
+	}
+}
+
 // --- Tests for gen-make ---
 
 func TestRunGenMake_MissingTasksFlag(t *testing.T) {
@@ -1591,16 +1781,15 @@ func TestRunExec_TasksFlag_ResolvesPrompt(t *testing.T) {
 	t.Cleanup(func() { os.Chdir(origDir) })
 	os.Chdir(tmpDir)
 
-	// Create prompt file
+	// Create prompt file (relative path from tmpDir)
 	promptDir := filepath.Join(tmpDir, ".kiln", "prompts", "tasks")
 	os.MkdirAll(promptDir, 0o755)
-	promptPath := filepath.Join(promptDir, "my-task.md")
-	os.WriteFile(promptPath, []byte("do the thing"), 0o644)
+	os.WriteFile(filepath.Join(promptDir, "my-task.md"), []byte("do the thing"), 0o644)
 
-	// Create tasks.yaml
+	// Create tasks.yaml with relative prompt path
 	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte(`- id: my-task
-  prompt: `+promptPath+`
+  prompt: .kiln/prompts/tasks/my-task.md
   needs: []
 `), 0o644)
 
@@ -1655,18 +1844,17 @@ func TestRunExec_TasksFlag_PromptFileTakesPrecedence(t *testing.T) {
 	t.Cleanup(func() { os.Chdir(origDir) })
 	os.Chdir(tmpDir)
 
-	// Create override prompt file
+	// Create override prompt file (absolute path OK as --prompt-file flag)
 	overridePath := filepath.Join(tmpDir, "override.md")
 	os.WriteFile(overridePath, []byte("override prompt"), 0o644)
 
-	// Create task prompt file
-	taskPromptPath := filepath.Join(tmpDir, "task-prompt.md")
-	os.WriteFile(taskPromptPath, []byte("task prompt"), 0o644)
+	// Create task prompt file (relative path in tasks.yaml)
+	os.WriteFile(filepath.Join(tmpDir, "task-prompt.md"), []byte("task prompt"), 0o644)
 
-	// Create tasks.yaml
+	// Create tasks.yaml with relative prompt path
 	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte(`- id: my-task
-  prompt: `+taskPromptPath+`
+  prompt: task-prompt.md
   needs: []
 `), 0o644)
 
@@ -1697,12 +1885,11 @@ func TestRunExec_TasksFlag_ResolvesModel(t *testing.T) {
 	t.Cleanup(func() { os.Chdir(origDir) })
 	os.Chdir(tmpDir)
 
-	promptPath := filepath.Join(tmpDir, "p.md")
-	os.WriteFile(promptPath, []byte("test"), 0o644)
+	os.WriteFile(filepath.Join(tmpDir, "p.md"), []byte("test"), 0o644)
 
 	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte(`- id: my-task
-  prompt: `+promptPath+`
+  prompt: p.md
   needs: []
   model: claude-haiku-4-5-20251001
 `), 0o644)
@@ -1734,12 +1921,11 @@ func TestRunExec_TasksFlag_ModelFlagOverridesTaskModel(t *testing.T) {
 	t.Cleanup(func() { os.Chdir(origDir) })
 	os.Chdir(tmpDir)
 
-	promptPath := filepath.Join(tmpDir, "p.md")
-	os.WriteFile(promptPath, []byte("test"), 0o644)
+	os.WriteFile(filepath.Join(tmpDir, "p.md"), []byte("test"), 0o644)
 
 	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte(`- id: my-task
-  prompt: `+promptPath+`
+  prompt: p.md
   needs: []
   model: task-model-loses
 `), 0o644)
@@ -1798,7 +1984,7 @@ func TestRunExec_TasksFlag_EmptyPromptField(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for empty prompt field")
 	}
-	if !strings.Contains(err.Error(), "has no prompt field") {
+	if !strings.Contains(err.Error(), "prompt is required") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
