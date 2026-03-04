@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -948,8 +949,8 @@ func TestRunExec_TimeoutLogEntry(t *testing.T) {
 	}
 
 	logStr := string(logData)
-	if !strings.Contains(logStr, "kiln_timeout") {
-		t.Errorf("log file missing timeout entry, got: %s", logStr)
+	if !strings.Contains(logStr, `"timeout"`) {
+		t.Errorf("log file missing timeout status, got: %s", logStr)
 	}
 	if !strings.Contains(logStr, "timeout-log") {
 		t.Errorf("log file missing task ID, got: %s", logStr)
@@ -1734,6 +1735,7 @@ func TestRunExec_AttemptLogEntries(t *testing.T) {
 		"--retries", "1",
 	}, &bytes.Buffer{})
 
+	// Log is overwritten per attempt; final log reflects the successful last attempt.
 	logPath := filepath.Join(tmpDir, ".kiln", "logs", "log-entries.json")
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
@@ -1741,13 +1743,12 @@ func TestRunExec_AttemptLogEntries(t *testing.T) {
 	}
 	logStr := string(logData)
 
-	if !strings.Contains(logStr, "kiln_attempt") {
-		t.Errorf("log missing kiln_attempt entries, got: %s", logStr)
+	// Final log should reflect the successful (complete) attempt.
+	if !strings.Contains(logStr, `"complete"`) {
+		t.Errorf("log should show complete status from last attempt, got: %s", logStr)
 	}
-	// Should have 2 attempt entries (attempt 1 and attempt 2)
-	count := strings.Count(logStr, "kiln_attempt")
-	if count != 2 {
-		t.Errorf("expected 2 kiln_attempt log entries, got %d; log: %s", count, logStr)
+	if !strings.Contains(logStr, "log-entries") {
+		t.Errorf("log missing task ID, got: %s", logStr)
 	}
 }
 
@@ -1989,7 +1990,7 @@ func TestRunExec_TasksFlag_EmptyPromptField(t *testing.T) {
 	}
 }
 
-func TestRunExec_TaskIDMismatch_WarnButComplete(t *testing.T) {
+func TestRunExec_TaskIDMismatch_WarnAndNotComplete(t *testing.T) {
 	origBuilder := commandBuilder
 	t.Cleanup(func() { commandBuilder = origBuilder })
 	commandBuilder = fakeCommandBuilder("complete")
@@ -2001,7 +2002,7 @@ func TestRunExec_TaskIDMismatch_WarnButComplete(t *testing.T) {
 
 	promptPath := filepath.Join(tmpDir, "prompt.md")
 	os.WriteFile(promptPath, []byte("test"), 0o644)
-	// KILN_TEST_TASK_ID defaults to "test-task"; use a different task-id to force mismatch.
+	// Helper emits task_id="test-task"; run with a different id to force mismatch.
 	t.Setenv("KILN_TEST_TASK_ID", "test-task")
 
 	var stdout bytes.Buffer
@@ -2009,11 +2010,17 @@ func TestRunExec_TaskIDMismatch_WarnButComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if code != 2 {
-		t.Fatalf("expected exit code 2 despite mismatch, got %d", code)
+	// Mismatch means footer_valid=false → not treated as complete → exit 0.
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for task_id mismatch (footer_valid=false), got %d", code)
 	}
 	if !strings.Contains(stdout.String(), "warning") {
 		t.Errorf("expected mismatch warning in stdout, got: %s", stdout.String())
+	}
+	// No .done file should be created.
+	donePath := filepath.Join(tmpDir, ".kiln", "done", "different-id.done")
+	if _, err := os.Stat(donePath); !os.IsNotExist(err) {
+		t.Errorf("expected no .done file for task_id mismatch, but: %v", err)
 	}
 }
 
@@ -2390,5 +2397,263 @@ func TestRun_ValidateCyclesFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "cycle detected") {
 		t.Fatalf("expected cycle error in stderr, got: %s", stderr.String())
+	}
+}
+
+// --- Structured log format tests ---
+
+func readExecLog(t *testing.T, dir, taskID string) execRunLog {
+	t.Helper()
+	logPath := filepath.Join(dir, ".kiln", "logs", taskID+".json")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log file %s: %v", logPath, err)
+	}
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("failed to unmarshal log file %s: %v\ncontent: %s", logPath, err, data)
+	}
+	return entry
+}
+
+func TestExecLog_ValidFooter_FooterValidTrue(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "log-valid")
+
+	runExec([]string{"--task-id", "log-valid", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "log-valid")
+	if !entry.FooterValid {
+		t.Errorf("expected footer_valid=true, got false; status=%s", entry.Status)
+	}
+	if entry.Status != "complete" {
+		t.Errorf("expected status=complete, got %s", entry.Status)
+	}
+	if entry.Footer == nil {
+		t.Fatal("expected footer to be populated")
+	}
+	if entry.Footer.Kiln.Status != "complete" {
+		t.Errorf("expected footer.kiln.status=complete, got %s", entry.Footer.Kiln.Status)
+	}
+	if entry.Footer.Kiln.TaskID != "log-valid" {
+		t.Errorf("expected footer.kiln.task_id=log-valid, got %s", entry.Footer.Kiln.TaskID)
+	}
+	if entry.TaskID != "log-valid" {
+		t.Errorf("expected task_id=log-valid, got %s", entry.TaskID)
+	}
+}
+
+func TestExecLog_MissingFooter_FooterValidFalse(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("no_footer")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{"--task-id", "log-no-footer", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "log-no-footer")
+	if entry.FooterValid {
+		t.Errorf("expected footer_valid=false for missing footer")
+	}
+	if entry.Status != "error" {
+		t.Errorf("expected status=error, got %s", entry.Status)
+	}
+	if entry.Footer != nil {
+		t.Errorf("expected footer to be nil for missing footer, got %+v", entry.Footer)
+	}
+}
+
+func TestExecLog_FooterTaskIDMismatch_FooterValidFalse(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	// Helper will emit task_id="wrong-id" but we run with task-id="expected-id".
+	t.Setenv("KILN_TEST_TASK_ID", "wrong-id")
+
+	runExec([]string{"--task-id", "expected-id", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "expected-id")
+	if entry.FooterValid {
+		t.Errorf("expected footer_valid=false for task_id mismatch")
+	}
+	if entry.Footer == nil {
+		t.Fatal("expected footer to be captured even on task_id mismatch")
+	}
+	if entry.Footer.Kiln.TaskID != "wrong-id" {
+		t.Errorf("expected captured footer task_id=wrong-id, got %s", entry.Footer.Kiln.TaskID)
+	}
+}
+
+func TestExecLog_Timeout_StatusTimeout(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("hang")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{
+		"--task-id", "log-timeout",
+		"--prompt-file", promptPath,
+		"--timeout", "200ms",
+	}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "log-timeout")
+	if entry.Status != "timeout" {
+		t.Errorf("expected status=timeout, got %s", entry.Status)
+	}
+	if entry.FooterValid {
+		t.Errorf("expected footer_valid=false on timeout")
+	}
+	if entry.ExitCode != 20 {
+		t.Errorf("expected exit_code=20, got %d", entry.ExitCode)
+	}
+}
+
+func TestExecLog_AlwaysCreated(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{"--task-id", "log-fail", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	logPath := filepath.Join(tmpDir, ".kiln", "logs", "log-fail.json")
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("expected log file to be created even on failure, got: %v", err)
+	}
+}
+
+func TestExecLog_DoneOnlyOnFooterValid(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	// task_id mismatch → footer_valid=false → no .done
+	t.Setenv("KILN_TEST_TASK_ID", "wrong-id")
+	runExec([]string{"--task-id", "mismatch-done", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	donePath := filepath.Join(tmpDir, ".kiln", "done", "mismatch-done.done")
+	if _, err := os.Stat(donePath); !os.IsNotExist(err) {
+		t.Errorf("expected no .done file when footer_valid=false, but: %v", err)
+	}
+}
+
+func TestExecLog_ContainsEventsAndTimestamps(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("success")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("hello world"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "log-events")
+
+	runExec([]string{"--task-id", "log-events", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "log-events")
+	if len(entry.Events) == 0 {
+		t.Error("expected at least one event in log")
+	}
+	if entry.StartedAt.IsZero() {
+		t.Error("expected started_at to be set")
+	}
+	if entry.EndedAt.IsZero() {
+		t.Error("expected ended_at to be set")
+	}
+	if entry.DurationMs < 0 {
+		t.Errorf("expected non-negative duration_ms, got %d", entry.DurationMs)
+	}
+	// Check that events have types
+	for i, ev := range entry.Events {
+		if ev.Type != "stdout" && ev.Type != "stderr" {
+			t.Errorf("event[%d]: unexpected type %q", i, ev.Type)
+		}
+		if ev.TS.IsZero() {
+			t.Errorf("event[%d]: expected ts to be set", i)
+		}
+	}
+}
+
+func TestExecLog_LogFileIsValidJSON(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "log-json")
+
+	runExec([]string{"--task-id", "log-json", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	logPath := filepath.Join(tmpDir, ".kiln", "logs", "log-json.json")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log file: %v", err)
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Errorf("log file is not valid JSON: %v\ncontent: %s", err, data)
+	}
+	// Verify required top-level keys are present
+	for _, key := range []string{"task_id", "started_at", "ended_at", "duration_ms", "status", "footer_valid", "events"} {
+		if _, ok := v[key]; !ok {
+			t.Errorf("log missing required key %q", key)
+		}
 	}
 }

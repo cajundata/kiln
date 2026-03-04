@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -56,6 +57,92 @@ func isRetryable(err error) bool {
 type kilnFooterPayload struct {
 	Status string `json:"status"`
 	TaskID string `json:"task_id"`
+	Notes  string `json:"notes,omitempty"`
+}
+
+// logEvent is a single captured output line with a timestamp and stream type.
+type logEvent struct {
+	TS   time.Time `json:"ts"`
+	Type string    `json:"type"` // "stdout" or "stderr"
+	Line string    `json:"line"`
+}
+
+// execRunLog is the structured JSON log written for each kiln exec attempt.
+type execRunLog struct {
+	TaskID      string              `json:"task_id"`
+	StartedAt   time.Time           `json:"started_at"`
+	EndedAt     time.Time           `json:"ended_at"`
+	DurationMs  int64               `json:"duration_ms"`
+	Model       string              `json:"model"`
+	PromptFile  string              `json:"prompt_file"`
+	ExitCode    int                 `json:"exit_code"`
+	Status      string              `json:"status"` // "complete","not_complete","blocked","timeout","error"
+	Footer      *kilnFooterEnvelope `json:"footer,omitempty"`
+	FooterValid bool                `json:"footer_valid"`
+	Events      []logEvent          `json:"events"`
+}
+
+// lineCapture is an io.Writer that forwards writes to an optional passthrough
+// writer and records each complete line as a logEvent.
+type lineCapture struct {
+	out    io.Writer
+	evType string
+	mu     *sync.Mutex
+	events *[]logEvent
+	buf    []byte
+}
+
+func newLineCapture(out io.Writer, evType string, mu *sync.Mutex, events *[]logEvent) *lineCapture {
+	return &lineCapture{out: out, evType: evType, mu: mu, events: events}
+}
+
+func (lc *lineCapture) Write(p []byte) (int, error) {
+	n := len(p)
+	var writeErr error
+	if lc.out != nil {
+		_, writeErr = lc.out.Write(p)
+	}
+	lc.buf = append(lc.buf, p...)
+	for {
+		idx := bytes.IndexByte(lc.buf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := string(lc.buf[:idx])
+		ts := time.Now()
+		lc.mu.Lock()
+		*lc.events = append(*lc.events, logEvent{TS: ts, Type: lc.evType, Line: line})
+		lc.mu.Unlock()
+		lc.buf = lc.buf[idx+1:]
+	}
+	return n, writeErr
+}
+
+func (lc *lineCapture) flush() {
+	if len(lc.buf) > 0 {
+		ts := time.Now()
+		lc.mu.Lock()
+		*lc.events = append(*lc.events, logEvent{TS: ts, Type: lc.evType, Line: string(lc.buf)})
+		lc.mu.Unlock()
+		lc.buf = nil
+	}
+}
+
+// writeExecLog atomically writes entry as JSON to .kiln/logs/<taskID>.json.
+func writeExecLog(logDir, taskID string, entry execRunLog) error {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+	logPath := filepath.Join(logDir, taskID+".json")
+	tmpPath := logPath + ".tmp"
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("failed to marshal log: %w", err)
+	}
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write log: %w", err)
+	}
+	return os.Rename(tmpPath, logPath)
 }
 
 // kilnFooterEnvelope is the top-level JSON wrapper for the footer.
@@ -533,56 +620,38 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	}
 	prompt := string(data)
 
-	// Ensure log directory exists
-	logDir := ".kiln/logs"
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return 0, fmt.Errorf("failed to create log directory: %w", err)
-	}
-
-	// Open log file
-	logPath := filepath.Join(logDir, *taskID+".json")
-	logFile, err := os.Create(logPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create log file %s: %w", logPath, err)
-	}
-	defer logFile.Close()
-
 	model := resolveModel(*modelFlag, taskModel)
 	maxAttempts := 1 + *retriesFlag
+	logDir := ".kiln/logs"
 
 	var lastErr error
-	var lastCode int
+	var lastLog execRunLog
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		// Write per-attempt header to log
-		attemptEntry := map[string]interface{}{
-			"type":    "kiln_attempt",
-			"attempt": attempt,
-			"of":      maxAttempts,
-			"task_id": *taskID,
-		}
-		if b, jsonErr := json.Marshal(attemptEntry); jsonErr == nil {
-			fmt.Fprintf(logFile, "%s\n", b)
+		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, stdout)
+
+		// Always write the log, even on error.
+		if writeErr := writeExecLog(logDir, *taskID, log); writeErr != nil {
+			fmt.Fprintf(stdout, "warning: failed to write exec log: %v\n", writeErr)
 		}
 
-		code, err := execOnce(*taskID, prompt, model, timeout, logFile, stdout)
 		if err == nil {
-			// Write done marker only on complete (code 2)
-			if code == 2 {
+			if log.FooterValid {
 				doneDir := ".kiln/done"
 				if mkErr := os.MkdirAll(doneDir, 0o755); mkErr == nil {
 					donePath := filepath.Join(doneDir, *taskID+".done")
 					os.WriteFile(donePath, nil, 0o644)
 				}
+				return 2, nil
 			}
-			return code, nil
+			return 0, nil
 		}
 
 		lastErr = err
-		lastCode = code
+		lastLog = log
 
 		if !isRetryable(err) {
-			return lastCode, lastErr
+			return lastLog.ExitCode, lastErr
 		}
 
 		if attempt < maxAttempts && retryBackoff > 0 {
@@ -590,58 +659,89 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		}
 	}
 
-	return lastCode, lastErr
+	return lastLog.ExitCode, lastErr
 }
 
-// execOnce runs a single claude invocation attempt and returns its exit code and any error.
-func execOnce(taskID, prompt, model string, timeout time.Duration, logFile io.Writer, stdout io.Writer) (int, error) {
+// execOnce runs a single claude invocation attempt and returns a structured log entry and any error.
+func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, stdout io.Writer) (execRunLog, error) {
+	startedAt := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	var events []logEvent
+	var mu sync.Mutex
+	var capturedBuf bytes.Buffer
+
+	// stdout is captured both for passthrough and footer parsing; stderr only passes through.
+	stdoutCapture := newLineCapture(io.MultiWriter(stdout, &capturedBuf), "stdout", &mu, &events)
+	stderrCapture := newLineCapture(stdout, "stderr", &mu, &events)
+
 	cmd := commandBuilder(ctx, prompt, model)
+	cmd.Stdout = stdoutCapture
+	cmd.Stderr = stderrCapture
 
-	var captured bytes.Buffer
-	out := io.MultiWriter(stdout, logFile, &captured)
-	cmd.Stdout = out
-	cmd.Stderr = out
+	runErr := cmd.Run()
+	stdoutCapture.flush()
+	stderrCapture.flush()
 
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			entry := map[string]string{
-				"type":    "kiln_timeout",
-				"task_id": taskID,
-				"message": fmt.Sprintf("process killed after %s timeout", timeout),
-			}
-			if b, jsonErr := json.Marshal(entry); jsonErr == nil {
-				fmt.Fprintf(logFile, "\n%s\n", b)
-			}
-			return 0, &timeoutError{taskID: taskID, timeout: timeout}
-		}
-		return 0, &claudeExitError{err: err}
+	endedAt := time.Now()
+	entry := execRunLog{
+		TaskID:     taskID,
+		StartedAt:  startedAt,
+		EndedAt:    endedAt,
+		DurationMs: endedAt.Sub(startedAt).Milliseconds(),
+		Model:      model,
+		PromptFile: promptFile,
+		Events:     events,
 	}
 
-	// Parse the kiln JSON footer from the captured output.
-	status, footerTaskID, ok := parseFooter(captured.String())
+	if runErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			entry.Status = "timeout"
+			entry.ExitCode = 20
+			return entry, &timeoutError{taskID: taskID, timeout: timeout}
+		}
+		entry.Status = "error"
+		entry.ExitCode = 1
+		return entry, &claudeExitError{err: runErr}
+	}
+
+	footerStatus, footerTaskID, ok := parseFooter(capturedBuf.String())
 	if !ok {
-		return 0, &footerError{msg: fmt.Sprintf(
+		entry.Status = "error"
+		entry.ExitCode = 10
+		return entry, &footerError{msg: fmt.Sprintf(
 			"missing or invalid footer in claude output\n"+
 				`expected format: {"kiln":{"status":"complete|not_complete|blocked","task_id":"%s"}}`,
 			taskID,
 		)}
 	}
 
-	if footerTaskID != taskID {
-		fmt.Fprintf(stdout, "warning: footer task_id %q does not match expected %q\n", footerTaskID, taskID)
-	}
+	entry.Footer = &kilnFooterEnvelope{Kiln: kilnFooterPayload{Status: footerStatus, TaskID: footerTaskID}}
 
-	switch status {
+	switch footerStatus {
 	case "complete":
-		return 2, nil
+		if footerTaskID == taskID {
+			entry.FooterValid = true
+			entry.Status = "complete"
+			entry.ExitCode = 0
+		} else {
+			fmt.Fprintf(stdout, "warning: footer task_id %q does not match expected %q\n", footerTaskID, taskID)
+			entry.FooterValid = false
+			entry.Status = "complete"
+			entry.ExitCode = 0
+		}
+		return entry, nil
 	case "not_complete", "blocked":
-		return 0, nil
+		entry.FooterValid = false
+		entry.Status = footerStatus
+		entry.ExitCode = 0
+		return entry, nil
 	default:
-		return 0, &footerError{msg: fmt.Sprintf(
-			"invalid footer status %q; expected complete, not_complete, or blocked", status,
+		entry.Status = "error"
+		entry.ExitCode = 10
+		return entry, &footerError{msg: fmt.Sprintf(
+			"invalid footer status %q; expected complete, not_complete, or blocked", footerStatus,
 		)}
 	}
 }
