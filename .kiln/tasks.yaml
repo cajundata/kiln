@@ -31,6 +31,32 @@
   needs:
     - validate-cycles
 
+- id: status-command
+  prompt: .kiln/prompts/tasks/status-command.md
+  needs:
+    - validate-schema
+
+- id: exec-tasks-resolution
+  prompt: .kiln/prompts/tasks/exec-tasks-resolution.md
+  needs:
+    - validate-schema
+
+- id: task-model-selection
+  prompt: .kiln/prompts/tasks/task-model-selection.md
+  needs:
+    - exec-tasks-resolution
+
+- id: exec-retry-backoff
+  prompt: .kiln/prompts/tasks/exec-retry-backoff.md
+  needs:
+    - exec-retry
+
+- id: plan-command
+  prompt: .kiln/prompts/tasks/plan-command.md
+  needs:
+    - exec-tasks-resolution
+    - prompt-extract-tasks
+
 - id: makefile-setup
   prompt: .kiln/prompts/tasks/makefile-setup.md
   needs: []
