@@ -2192,3 +2192,203 @@ func TestRun_StatusDispatch(t *testing.T) {
 		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, stderr.String())
 	}
 }
+
+// --- Tests for validate-cycles ---
+
+func writeTasksFile(t *testing.T, dir, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, "tasks.yaml")
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write tasks file: %v", err)
+	}
+	return p
+}
+
+func TestValidateCycles_MissingTasksFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := runValidateCycles([]string{}, &stdout)
+	if err == nil {
+		t.Fatal("expected error for missing --tasks flag")
+	}
+	if !strings.Contains(err.Error(), "--tasks is required") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = stderr
+}
+
+func TestValidateCycles_UnknownDependency(t *testing.T) {
+	tmp := t.TempDir()
+	p := writeTasksFile(t, tmp, `- id: alpha
+  prompt: a.md
+  needs:
+    - ghost
+`)
+	var stdout bytes.Buffer
+	err := runValidateCycles([]string{"--tasks", p}, &stdout)
+	if err == nil {
+		t.Fatal("expected error for unknown dependency")
+	}
+	if !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("error should mention task and missing dep, got: %v", err)
+	}
+}
+
+func TestValidateCycles_SimpleCycle(t *testing.T) {
+	tmp := t.TempDir()
+	p := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs:
+    - b
+- id: b
+  prompt: b.md
+  needs:
+    - a
+`)
+	var stdout bytes.Buffer
+	err := runValidateCycles([]string{"--tasks", p}, &stdout)
+	if err == nil {
+		t.Fatal("expected cycle error")
+	}
+	if !strings.Contains(err.Error(), "cycle detected") {
+		t.Fatalf("expected cycle detected message, got: %v", err)
+	}
+	// Should mention both nodes
+	if !strings.Contains(err.Error(), "a") || !strings.Contains(err.Error(), "b") {
+		t.Fatalf("cycle path should mention involved tasks, got: %v", err)
+	}
+}
+
+func TestValidateCycles_LongerCycle(t *testing.T) {
+	tmp := t.TempDir()
+	p := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs:
+    - b
+- id: b
+  prompt: b.md
+  needs:
+    - c
+- id: c
+  prompt: c.md
+  needs:
+    - a
+`)
+	var stdout bytes.Buffer
+	err := runValidateCycles([]string{"--tasks", p}, &stdout)
+	if err == nil {
+		t.Fatal("expected cycle error")
+	}
+	if !strings.Contains(err.Error(), "cycle detected") {
+		t.Fatalf("expected cycle detected message, got: %v", err)
+	}
+	// All three nodes should appear in the path
+	if !strings.Contains(err.Error(), "a") || !strings.Contains(err.Error(), "b") || !strings.Contains(err.Error(), "c") {
+		t.Fatalf("cycle path should mention all involved tasks, got: %v", err)
+	}
+}
+
+func TestValidateCycles_SelfDependency(t *testing.T) {
+	tmp := t.TempDir()
+	p := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs:
+    - a
+`)
+	var stdout bytes.Buffer
+	err := runValidateCycles([]string{"--tasks", p}, &stdout)
+	if err == nil {
+		t.Fatal("expected cycle error for self-dependency")
+	}
+	if !strings.Contains(err.Error(), "cycle detected") {
+		t.Fatalf("expected cycle detected message, got: %v", err)
+	}
+	// Self-cycle: a -> a
+	if !strings.Contains(err.Error(), "a -> a") {
+		t.Fatalf("expected a -> a in path, got: %v", err)
+	}
+}
+
+func TestValidateCycles_AcyclicGraph_Success(t *testing.T) {
+	tmp := t.TempDir()
+	p := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs: []
+- id: b
+  prompt: b.md
+  needs:
+    - a
+- id: c
+  prompt: c.md
+  needs:
+    - a
+    - b
+`)
+	var stdout bytes.Buffer
+	err := runValidateCycles([]string{"--tasks", p}, &stdout)
+	if err != nil {
+		t.Fatalf("expected no error for acyclic graph, got: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "validate-cycles: OK") {
+		t.Fatalf("expected OK message, got: %s", stdout.String())
+	}
+}
+
+func TestValidateCycles_DeterministicOutput(t *testing.T) {
+	tmp := t.TempDir()
+	// a -> b -> c -> a cycle; running twice should give same error message
+	p := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs:
+    - b
+- id: b
+  prompt: b.md
+  needs:
+    - c
+- id: c
+  prompt: c.md
+  needs:
+    - a
+`)
+	var out1, out2 bytes.Buffer
+	err1 := runValidateCycles([]string{"--tasks", p}, &out1)
+	err2 := runValidateCycles([]string{"--tasks", p}, &out2)
+	if err1 == nil || err2 == nil {
+		t.Fatal("expected cycle errors")
+	}
+	if err1.Error() != err2.Error() {
+		t.Fatalf("non-deterministic output:\n  run1: %v\n  run2: %v", err1, err2)
+	}
+}
+
+func TestRun_ValidateCyclesDispatch(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := writeTasksFile(t, tmp, `- id: t1
+  prompt: p.md
+  needs: []
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"validate-cycles", "--tasks", tasksPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "validate-cycles: OK") {
+		t.Fatalf("expected OK in stdout, got: %s", stdout.String())
+	}
+}
+
+func TestRun_ValidateCyclesFailure(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := writeTasksFile(t, tmp, `- id: a
+  prompt: a.md
+  needs:
+    - a
+`)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"validate-cycles", "--tasks", tasksPath}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "cycle detected") {
+		t.Fatalf("expected cycle error in stderr, got: %s", stderr.String())
+	}
+}

@@ -127,6 +127,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "validate-cycles":
+		if err := runValidateCycles(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "validate-cycles: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1
@@ -194,6 +200,94 @@ func loadTasks(path string) ([]Task, error) {
 	}
 
 	return tasks, nil
+}
+
+func runValidateCycles(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("validate-cycles", flag.ContinueOnError)
+	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *tasksFile == "" {
+		return fmt.Errorf("--tasks is required")
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	// Build ID set for existence check and adjacency list in definition order.
+	idSet := make(map[string]bool, len(tasks))
+	adj := make(map[string][]string, len(tasks))
+	order := make([]string, 0, len(tasks))
+	for _, t := range tasks {
+		idSet[t.ID] = true
+		adj[t.ID] = t.Needs
+		order = append(order, t.ID)
+	}
+
+	// 1. Validate all dependency references exist.
+	for _, t := range tasks {
+		for _, dep := range t.Needs {
+			if !idSet[dep] {
+				return fmt.Errorf("task %q: unknown dependency %q", t.ID, dep)
+			}
+		}
+	}
+
+	// 2. Cycle detection via DFS with color marking.
+	// Colors: 0=white (unvisited), 1=gray (in current path), 2=black (fully visited).
+	color := make(map[string]int, len(tasks))
+	parent := make(map[string]string, len(tasks))
+
+	var cycleErr error
+
+	var dfs func(id string) bool
+	dfs = func(id string) bool {
+		color[id] = 1 // gray: on current DFS path
+		for _, dep := range adj[id] {
+			if color[dep] == 1 {
+				// Back edge found: dep is an ancestor on the current path.
+				// Reconstruct cycle: dep -> ... -> id -> dep
+				path := []string{}
+				cur := id
+				for cur != dep {
+					path = append(path, cur)
+					cur = parent[cur]
+				}
+				// path is [id, ..., child_of_dep] in reverse; reverse it.
+				for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+					path[i], path[j] = path[j], path[i]
+				}
+				fullPath := append([]string{dep}, path...)
+				fullPath = append(fullPath, dep)
+				cycleErr = fmt.Errorf("cycle detected: %s", strings.Join(fullPath, " -> "))
+				return true
+			}
+			if color[dep] == 0 {
+				parent[dep] = id
+				if dfs(dep) {
+					return true
+				}
+			}
+		}
+		color[id] = 2 // black: fully explored
+		return false
+	}
+
+	for _, id := range order {
+		if color[id] == 0 {
+			if dfs(id) {
+				return cycleErr
+			}
+		}
+	}
+
+	fmt.Fprintln(stdout, "validate-cycles: OK")
+	return nil
 }
 
 func runValidateSchema(args []string, stdout io.Writer) error {
