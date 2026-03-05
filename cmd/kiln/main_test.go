@@ -662,6 +662,24 @@ func TestHelperProcess(t *testing.T) {
 			os.WriteFile(outPath, []byte("not: valid: yaml: [[["), 0o644)
 		}
 		os.Exit(0)
+	case "gen-prompts-write":
+		// Write dummy prompt content to KILN_TEST_GEN_PROMPTS_OUT and exit 0.
+		outPath := os.Getenv("KILN_TEST_GEN_PROMPTS_OUT")
+		if outPath != "" {
+			os.MkdirAll(filepath.Dir(outPath), 0o755)
+			os.WriteFile(outPath, []byte("# generated prompt\n"), 0o644)
+		}
+		os.Exit(0)
+	case "env-check":
+		// Read KILN_TEST_CHECK_VAR to determine which env var to echo back.
+		// Outputs the value of the named env var, then a complete footer.
+		checkVar := os.Getenv("KILN_TEST_CHECK_VAR")
+		if checkVar != "" {
+			os.Stdout.WriteString(os.Getenv(checkVar) + "\n")
+		}
+		taskID := taskIDFromEnv()
+		os.Stdout.WriteString(`{"kiln":{"status":"complete","task_id":"` + taskID + `"}}` + "\n")
+		os.Exit(0)
 	default:
 		os.Stderr.WriteString("unknown helper mode\n")
 		os.Exit(2)
@@ -3034,5 +3052,989 @@ func TestRunPlan_DefaultFlags(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "PRD.md") {
 		t.Fatalf("expected error to mention PRD.md, got: %v", err)
+	}
+}
+
+// genPromptsCommandBuilder returns a commandBuilder that runs the gen-prompts-write helper.
+// outPath is the prompt file path that the helper will create.
+func genPromptsCommandBuilder(outPath string) func(context.Context, string, string) *exec.Cmd {
+	return func(ctx context.Context, prompt, model string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(),
+			"KILN_TEST_HELPER_MODE=gen-prompts-write",
+			"KILN_TEST_GEN_PROMPTS_OUT="+outPath,
+		)
+		return cmd
+	}
+}
+
+// --- Tests for runGenPrompts ---
+
+func TestRunGenPrompts_MissingTasksFile(t *testing.T) {
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "/nonexistent/tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", ".kiln/templates/<id>.md",
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for missing tasks file")
+	}
+	if !strings.Contains(err.Error(), "tasks") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunGenPrompts_MissingPRD(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "nonexistent.md",
+		"--template", "template.md",
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for missing PRD file")
+	}
+	if !strings.Contains(err.Error(), "failed to read PRD file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunGenPrompts_MissingTemplate(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "nonexistent.md",
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for missing template file")
+	}
+	if !strings.Contains(err.Error(), "failed to read template file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunGenPrompts_SkipsExistingPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	os.WriteFile("alpha.md", []byte("existing content"), 0o644)
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+	os.WriteFile("template.md", []byte("# Template"), 0o644)
+
+	callCount := 0
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		callCount++
+		return exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+	}
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "template.md",
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callCount != 0 {
+		t.Fatalf("expected Claude not to be called for existing prompt, but got %d calls", callCount)
+	}
+	if !strings.Contains(out.String(), "skipped 1") {
+		t.Fatalf("expected skipped 1 in output, got: %s", out.String())
+	}
+	data, _ := os.ReadFile("alpha.md")
+	if string(data) != "existing content" {
+		t.Fatal("existing prompt was modified unexpectedly")
+	}
+}
+
+func TestRunGenPrompts_OverwriteExisting(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	os.WriteFile("alpha.md", []byte("old content"), 0o644)
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+	os.WriteFile("template.md", []byte("# Template"), 0o644)
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = genPromptsCommandBuilder(filepath.Join(tmp, "alpha.md"))
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "template.md",
+		"--overwrite",
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), "generated 1") {
+		t.Fatalf("expected generated 1 in output, got: %s", out.String())
+	}
+	data, _ := os.ReadFile("alpha.md")
+	if string(data) == "old content" {
+		t.Fatal("expected prompt file to be regenerated")
+	}
+}
+
+func TestRunGenPrompts_GeneratesNewPrompt(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	os.MkdirAll("prompts", 0o755)
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: prompts/alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+	os.WriteFile("template.md", []byte("# Template"), 0o644)
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = genPromptsCommandBuilder(filepath.Join(tmp, "prompts", "alpha.md"))
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "template.md",
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), "generated 1") {
+		t.Fatalf("expected generated 1 in output, got: %s", out.String())
+	}
+	if _, err := os.Stat("prompts/alpha.md"); err != nil {
+		t.Fatalf("expected prompt file to exist: %v", err)
+	}
+}
+
+func TestRun_GenPromptsDispatch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+	os.WriteFile("template.md", []byte("# Template"), 0o644)
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = genPromptsCommandBuilder(filepath.Join(tmp, "alpha.md"))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"gen-prompts",
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "template.md",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %s", code, stderr.String())
+	}
+}
+
+func TestRunGenPrompts_DefaultFlags(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete") // won't be reached
+
+	var out bytes.Buffer
+	// No flags -> should fail on missing .kiln/tasks.yaml (the default tasks path).
+	err := runGenPrompts([]string{}, &out)
+	if err == nil {
+		t.Fatal("expected error with default flags when tasks.yaml absent")
+	}
+	if !strings.Contains(err.Error(), "tasks") {
+		t.Fatalf("expected error to mention tasks, got: %v", err)
+	}
+}
+
+func TestRunGenPrompts_DefaultModel(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+
+	os.WriteFile("tasks.yaml", []byte("- id: alpha\n  prompt: alpha.md\n  needs: []\n"), 0o644)
+	os.WriteFile("PRD.md", []byte("# PRD"), 0o644)
+	os.WriteFile("template.md", []byte("# Template"), 0o644)
+
+	var capturedModel string
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedModel = model
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(),
+			"KILN_TEST_HELPER_MODE=gen-prompts-write",
+			"KILN_TEST_GEN_PROMPTS_OUT="+filepath.Join(tmp, "alpha.md"),
+		)
+		return cmd
+	}
+
+	var out bytes.Buffer
+	err := runGenPrompts([]string{
+		"--tasks", "tasks.yaml",
+		"--prd", "PRD.md",
+		"--template", "template.md",
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedModel != genPromptsDefaultModel {
+		t.Fatalf("expected model %q, got %q", genPromptsDefaultModel, capturedModel)
+	}
+}
+
+// --- Tests for richer task schema ---
+
+func TestLoadTasks_RicherSchemaAllOptionalFields(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: rich-task
+  prompt: rich.md
+  needs: []
+  description: A fully-loaded task
+  kind: backend
+  tags:
+    - important
+    - infra
+  retries: 3
+  validation:
+    - go test ./...
+    - golangci-lint run
+  engine: claude
+  env:
+    MY_VAR: hello
+    ANOTHER_VAR: world
+`), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	task := tasks[0]
+	if task.Description != "A fully-loaded task" {
+		t.Errorf("unexpected description: %q", task.Description)
+	}
+	if task.Kind != "backend" {
+		t.Errorf("unexpected kind: %q", task.Kind)
+	}
+	if len(task.Tags) != 2 || task.Tags[0] != "important" || task.Tags[1] != "infra" {
+		t.Errorf("unexpected tags: %v", task.Tags)
+	}
+	if task.Retries != 3 {
+		t.Errorf("unexpected retries: %d", task.Retries)
+	}
+	if len(task.Validation) != 2 {
+		t.Errorf("unexpected validation: %v", task.Validation)
+	}
+	if task.Engine != "claude" {
+		t.Errorf("unexpected engine: %q", task.Engine)
+	}
+	if task.Env["MY_VAR"] != "hello" || task.Env["ANOTHER_VAR"] != "world" {
+		t.Errorf("unexpected env: %v", task.Env)
+	}
+}
+
+func TestLoadTasks_BackwardCompatOriginalFields(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: alpha
+  prompt: a.md
+  needs: []
+- id: beta
+  prompt: b.md
+  needs:
+    - alpha
+  timeout: 10m
+  model: claude-haiku-4-5-20251001
+`), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
+func TestLoadTasks_NegativeRetriesRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  retries: -1
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for negative retries")
+	}
+	if !strings.Contains(err.Error(), "retries must be >= 0") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_WhitespaceOnlyKindRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: bad-task\n  prompt: p.md\n  kind: \"   \"\n"), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for whitespace-only kind")
+	}
+	if !strings.Contains(err.Error(), "kind must not be whitespace-only") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_TagWithWhitespaceRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  tags:
+    - "foo bar"
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for tag with whitespace")
+	}
+	if !strings.Contains(err.Error(), "whitespace") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_EmptyTagRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  tags:
+    - ""
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for empty tag")
+	}
+	if !strings.Contains(err.Error(), "tags[0]") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_InvalidEnvKeyRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr string
+	}{
+		{"starts with digit", "1VAR", "not a valid environment variable name"},
+		{"contains space", "MY VAR", "not a valid environment variable name"},
+		{"contains dash", "MY-VAR", "not a valid environment variable name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			p := filepath.Join(tmp, "tasks.yaml")
+			content := "- id: bad-task\n  prompt: p.md\n  env:\n    " + tt.key + ": value\n"
+			os.WriteFile(p, []byte(content), 0o644)
+
+			_, err := loadTasks(p)
+			if err == nil {
+				t.Fatal("expected error for invalid env key")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected %q in error, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestLoadTasks_ValidEnvKeys(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: good-task
+  prompt: p.md
+  env:
+    MY_VAR: hello
+    _PRIVATE: world
+    VAR123: value
+    A: single
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error for valid env keys: %v", err)
+	}
+}
+
+func TestLoadTasks_UnknownFieldStillRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  unknown_field: value
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for unknown field (KnownFields still active)")
+	}
+	if !strings.Contains(err.Error(), "failed to parse tasks file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunExec_TaskRetriesOverridesDefault(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	var callCount int
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		callCount++
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=fail")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: retry-task
+  prompt: p.md
+  retries: 2
+`), 0o644)
+
+	// Do not pass --retries flag; task's retries field should be used
+	_, err := runExec([]string{
+		"--task-id", "retry-task",
+		"--tasks", tasksPath,
+	}, &bytes.Buffer{})
+
+	if err == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+	if callCount != 3 {
+		t.Errorf("expected 3 attempts (1 + 2 task retries), got %d", callCount)
+	}
+}
+
+func TestRunExec_TaskRetriesZeroUsesDefault(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	var callCount int
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		callCount++
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=fail")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	// No retries field (defaults to 0 = not set), --retries flag also defaults to 0
+	os.WriteFile(tasksPath, []byte("- id: no-retry-task\n  prompt: p.md\n"), 0o644)
+
+	_, err := runExec([]string{
+		"--task-id", "no-retry-task",
+		"--tasks", tasksPath,
+		// --retries not set → default 0
+	}, &bytes.Buffer{})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 attempt (no retries), got %d", callCount)
+	}
+}
+
+func TestRunExec_TaskEnvInjected(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	t.Setenv("KILN_TEST_CHECK_VAR", "MY_TASK_VAR")
+	t.Setenv("KILN_TEST_TASK_ID", "env-task")
+
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=env-check")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: env-task
+  prompt: p.md
+  env:
+    MY_TASK_VAR: hello-from-task
+`), 0o644)
+	os.WriteFile(filepath.Join(tmpDir, "p.md"), []byte("test"), 0o644)
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "env-task",
+		"--tasks", tasksPath,
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 2 {
+		t.Fatalf("expected exit code 2 (complete), got %d", code)
+	}
+	if !strings.Contains(stdout.String(), "hello-from-task") {
+		t.Errorf("expected task env var value in stdout, got: %s", stdout.String())
+	}
+}
+
+func TestRunExec_TaskEnvOverridesExisting(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	// Set an existing env var that the task will override
+	t.Setenv("KILN_TEST_OVERRIDE_VAR", "original-value")
+	t.Setenv("KILN_TEST_CHECK_VAR", "KILN_TEST_OVERRIDE_VAR")
+	t.Setenv("KILN_TEST_TASK_ID", "override-task")
+
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=env-check")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: override-task
+  prompt: p.md
+  env:
+    KILN_TEST_OVERRIDE_VAR: overridden-value
+`), 0o644)
+	os.WriteFile(filepath.Join(tmpDir, "p.md"), []byte("test"), 0o644)
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "override-task",
+		"--tasks", tasksPath,
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 2 {
+		t.Fatalf("expected exit code 2 (complete), got %d", code)
+	}
+	if !strings.Contains(stdout.String(), "overridden-value") {
+		t.Errorf("expected overridden value in stdout, got: %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "original-value") {
+		t.Errorf("expected original value to be overridden, but got: %s", stdout.String())
+	}
+}
+
+// --- Tests for state management (loadState, saveState, classifyError) ---
+
+func TestLoadState_FileNotFound(t *testing.T) {
+	tmp := t.TempDir()
+	state, err := loadState(filepath.Join(tmp, "state.json"))
+	if err != nil {
+		t.Fatalf("expected no error for missing file, got: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected non-nil state manifest")
+	}
+	if state.Tasks == nil {
+		t.Fatal("expected non-nil Tasks map")
+	}
+	if len(state.Tasks) != 0 {
+		t.Fatalf("expected empty Tasks map, got %d entries", len(state.Tasks))
+	}
+}
+
+func TestLoadState_ValidJSON(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "state.json")
+	data := `{"tasks":{"my-task":{"status":"completed","attempts":2}},"last_updated":"2026-01-01T00:00:00Z"}`
+	os.WriteFile(p, []byte(data), 0o644)
+
+	state, err := loadState(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ts := state.Tasks["my-task"]
+	if ts == nil {
+		t.Fatal("expected task state for my-task")
+	}
+	if ts.Status != "completed" {
+		t.Errorf("expected status completed, got %s", ts.Status)
+	}
+	if ts.Attempts != 2 {
+		t.Errorf("expected 2 attempts, got %d", ts.Attempts)
+	}
+}
+
+func TestLoadState_MalformedJSON(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "state.json")
+	os.WriteFile(p, []byte("not valid json {{{"), 0o644)
+
+	_, err := loadState(p)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+	if !strings.Contains(err.Error(), "failed to parse state file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSaveState_WritesValidJSON(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "state.json")
+	state := &StateManifest{
+		Tasks: map[string]*TaskState{
+			"task-a": {Status: "completed", Attempts: 1},
+		},
+	}
+
+	err := saveState(p, state)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("failed to read state file: %v", err)
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(data, &v); err != nil {
+		t.Fatalf("saved state is not valid JSON: %v", err)
+	}
+}
+
+func TestSaveState_LastUpdatedPopulated(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "state.json")
+	state := &StateManifest{Tasks: map[string]*TaskState{}}
+
+	before := time.Now()
+	err := saveState(p, state)
+	after := time.Now()
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state.LastUpdated.Before(before) || state.LastUpdated.After(after) {
+		t.Errorf("LastUpdated %v not in expected range [%v, %v]", state.LastUpdated, before, after)
+	}
+}
+
+func TestSaveState_AtomicWrite(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "state.json")
+	state := &StateManifest{Tasks: map[string]*TaskState{
+		"t1": {Status: "running"},
+	}}
+
+	if err := saveState(p, state); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// .tmp file should not exist after successful save
+	if _, err := os.Stat(p + ".tmp"); err == nil {
+		t.Error("expected .tmp file to be renamed away, but it still exists")
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Errorf("expected state file to exist: %v", err)
+	}
+}
+
+func TestClassifyError_Timeout(t *testing.T) {
+	err := &timeoutError{taskID: "t1", timeout: time.Minute}
+	if got := classifyError(err); got != "timeout" {
+		t.Errorf("expected timeout, got %s", got)
+	}
+}
+
+func TestClassifyError_ClaudeExit(t *testing.T) {
+	err := &claudeExitError{err: errors.New("exit 1")}
+	if got := classifyError(err); got != "claude_exit" {
+		t.Errorf("expected claude_exit, got %s", got)
+	}
+}
+
+func TestClassifyError_FooterInvalid(t *testing.T) {
+	err := &footerError{msg: "missing footer"}
+	if got := classifyError(err); got != "footer_invalid" {
+		t.Errorf("expected footer_invalid, got %s", got)
+	}
+}
+
+func TestClassifyError_Permanent(t *testing.T) {
+	err := errors.New("some other error")
+	if got := classifyError(err); got != "permanent" {
+		t.Errorf("expected permanent, got %s", got)
+	}
+}
+
+func TestStateTransition_PendingToRunningToCompleted(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "state-task")
+
+	var stdout bytes.Buffer
+	_, err := runExec([]string{
+		"--task-id", "state-task",
+		"--prompt-file", promptPath,
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	statePath := filepath.Join(tmpDir, ".kiln", "state.json")
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	ts := state.Tasks["state-task"]
+	if ts == nil {
+		t.Fatal("expected task state entry")
+	}
+	if ts.Status != "completed" {
+		t.Errorf("expected status completed, got %s", ts.Status)
+	}
+	if ts.Attempts != 1 {
+		t.Errorf("expected 1 attempt, got %d", ts.Attempts)
+	}
+	if ts.CompletedAt.IsZero() {
+		t.Error("expected CompletedAt to be set")
+	}
+}
+
+func TestStateTransition_PendingToRunningToFailed(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	var stdout bytes.Buffer
+	runExec([]string{
+		"--task-id", "fail-task",
+		"--prompt-file", promptPath,
+	}, &stdout)
+
+	statePath := filepath.Join(tmpDir, ".kiln", "state.json")
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	ts := state.Tasks["fail-task"]
+	if ts == nil {
+		t.Fatal("expected task state entry")
+	}
+	if ts.Status != "failed" {
+		t.Errorf("expected status failed, got %s", ts.Status)
+	}
+	if ts.LastError == "" {
+		t.Error("expected LastError to be set")
+	}
+	if ts.LastErrorClass != "claude_exit" {
+		t.Errorf("expected LastErrorClass claude_exit, got %s", ts.LastErrorClass)
+	}
+}
+
+func TestStateTransition_PendingToRunningToBlocked(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("blocked")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "blocked-task")
+
+	var stdout bytes.Buffer
+	runExec([]string{
+		"--task-id", "blocked-task",
+		"--prompt-file", promptPath,
+	}, &stdout)
+
+	statePath := filepath.Join(tmpDir, ".kiln", "state.json")
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	ts := state.Tasks["blocked-task"]
+	if ts == nil {
+		t.Fatal("expected task state entry")
+	}
+	if ts.Status != "blocked" {
+		t.Errorf("expected status blocked, got %s", ts.Status)
+	}
+	if ts.Attempts != 1 {
+		t.Errorf("expected 1 attempt, got %d", ts.Attempts)
+	}
+}
+
+func TestStateAttemptCountIncrementsAcrossRetries(t *testing.T) {
+	origBuilder := commandBuilder
+	origSleep := sleepFn
+	t.Cleanup(func() {
+		commandBuilder = origBuilder
+		sleepFn = origSleep
+	})
+	commandBuilder = fakeCommandBuilder("fail")
+	sleepFn = func(d time.Duration) {}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	var stdout bytes.Buffer
+	runExec([]string{
+		"--task-id", "retry-task",
+		"--prompt-file", promptPath,
+		"--retries", "2",
+		"--retry-backoff", "1ms",
+	}, &stdout)
+
+	statePath := filepath.Join(tmpDir, ".kiln", "state.json")
+	state, err := loadState(statePath)
+	if err != nil {
+		t.Fatalf("failed to load state: %v", err)
+	}
+	ts := state.Tasks["retry-task"]
+	if ts == nil {
+		t.Fatal("expected task state entry")
+	}
+	if ts.Attempts != 3 {
+		t.Errorf("expected 3 attempts (1 initial + 2 retries), got %d", ts.Attempts)
+	}
+}
+
+func TestRunStatus_ReadsStateJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: alpha
+  prompt: a.md
+  needs: []
+- id: beta
+  prompt: b.md
+  needs:
+    - alpha
+`), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"alpha":{"status":"completed","attempts":2},"beta":{"status":"failed","attempts":1,"last_error":"claude invocation failed"}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "ATTEMPTS") {
+		t.Errorf("expected ATTEMPTS column in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "LAST ERROR") {
+		t.Errorf("expected LAST ERROR column in output, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_EmptyStateMissingJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: t1
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "t1") {
+		t.Errorf("expected task t1 in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "runnable") {
+		t.Errorf("expected runnable status, got:\n%s", out)
 	}
 }

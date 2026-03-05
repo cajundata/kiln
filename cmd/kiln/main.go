@@ -285,6 +285,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "gen-prompts":
+		if err := runGenPrompts(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "gen-prompts: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1
@@ -293,15 +299,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 // Task represents a single entry in the tasks.yaml file.
 type Task struct {
-	ID      string   `yaml:"id"`
-	Prompt  string   `yaml:"prompt"`
-	Needs   []string `yaml:"needs"`
-	Timeout string   `yaml:"timeout,omitempty"`
-	Model   string   `yaml:"model,omitempty"`
+	ID          string            `yaml:"id"`
+	Prompt      string            `yaml:"prompt"`
+	Needs       []string          `yaml:"needs"`
+	Timeout     string            `yaml:"timeout,omitempty"`
+	Model       string            `yaml:"model,omitempty"`
+	Description string            `yaml:"description,omitempty"`
+	Kind        string            `yaml:"kind,omitempty"`
+	Tags        []string          `yaml:"tags,omitempty"`
+	Retries     int               `yaml:"retries,omitempty"`
+	Validation  []string          `yaml:"validation,omitempty"`
+	Engine      string            `yaml:"engine,omitempty"`
+	Env         map[string]string `yaml:"env,omitempty"`
 }
 
 // taskIDRegexp is the valid pattern for task IDs (kebab-case).
 var taskIDRegexp = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+
+// envVarKeyRegexp is the valid pattern for environment variable key names.
+var envVarKeyRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // loadTasks reads, parses, and validates a tasks.yaml file.
 // Unknown fields are rejected (strict schema).
@@ -347,6 +363,22 @@ func loadTasks(path string) ([]Task, error) {
 		for j, dep := range t.Needs {
 			if dep == "" {
 				return nil, fmt.Errorf("task %q: needs[%d] must not be empty", t.ID, j)
+			}
+		}
+		if t.Retries < 0 {
+			return nil, fmt.Errorf("task %q: retries must be >= 0, got %d", t.ID, t.Retries)
+		}
+		if t.Kind != "" && strings.TrimSpace(t.Kind) == "" {
+			return nil, fmt.Errorf("task %q: kind must not be whitespace-only", t.ID)
+		}
+		for j, tag := range t.Tags {
+			if tag == "" || strings.ContainsAny(tag, " \t\n\r\f\v") {
+				return nil, fmt.Errorf("task %q: tags[%d] must be non-empty and contain no whitespace", t.ID, j)
+			}
+		}
+		for k := range t.Env {
+			if !envVarKeyRegexp.MatchString(k) {
+				return nil, fmt.Errorf("task %q: env key %q is not a valid environment variable name", t.ID, k)
 			}
 		}
 	}
@@ -585,6 +617,80 @@ func runGenMake(args []string) error {
 	return nil
 }
 
+// StateManifest is the top-level state file written to .kiln/state.json.
+type StateManifest struct {
+	Tasks       map[string]*TaskState `json:"tasks"`
+	LastUpdated time.Time             `json:"last_updated"`
+}
+
+// TaskState holds per-task execution state persisted across kiln exec invocations.
+type TaskState struct {
+	Status         string    `json:"status"`
+	Attempts       int       `json:"attempts"`
+	LastAttemptAt  time.Time `json:"last_attempt_at,omitempty"`
+	LastError      string    `json:"last_error,omitempty"`
+	LastErrorClass string    `json:"last_error_class,omitempty"`
+	CompletedAt    time.Time `json:"completed_at,omitempty"`
+	DurationMs     int64     `json:"duration_ms,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	Notes          string    `json:"notes,omitempty"`
+}
+
+// loadState reads and unmarshals .kiln/state.json.
+// Returns an empty manifest (not error) if the file does not exist.
+func loadState(path string) (*StateManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &StateManifest{Tasks: make(map[string]*TaskState)}, nil
+		}
+		return nil, fmt.Errorf("failed to read state file: %w", err)
+	}
+	var s StateManifest
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil, fmt.Errorf("failed to parse state file: %w", err)
+	}
+	if s.Tasks == nil {
+		s.Tasks = make(map[string]*TaskState)
+	}
+	return &s, nil
+}
+
+// saveState atomically writes state to path (write to .tmp, then rename).
+// It sets LastUpdated before writing.
+func saveState(path string, state *StateManifest) error {
+	state.LastUpdated = time.Now()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return fmt.Errorf("failed to write state: %w", err)
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// classifyError returns an error classification string for state tracking.
+func classifyError(err error) string {
+	var te *timeoutError
+	if errors.As(err, &te) {
+		return "timeout"
+	}
+	var ce *claudeExitError
+	if errors.As(err, &ce) {
+		return "claude_exit"
+	}
+	var fe *footerError
+	if errors.As(err, &fe) {
+		return "footer_invalid"
+	}
+	return "permanent"
+}
+
 // hasUnfinishedDeps returns true if any of the given dependency IDs are not in the doneSet.
 func hasUnfinishedDeps(needs []string, doneSet map[string]bool) bool {
 	for _, dep := range needs {
@@ -621,10 +727,17 @@ func runStatus(args []string, stdout io.Writer) error {
 		}
 	}
 
+	// Load state.json for additional per-task info (attempts, last error).
+	// Ignore errors — treat as empty state.
+	state, _ := loadState(".kiln/state.json")
+	if state == nil {
+		state = &StateManifest{Tasks: make(map[string]*TaskState)}
+	}
+
 	// Classify and print
 	var doneCount, runnableCount int
-	fmt.Fprintf(stdout, "%-30s %-10s %s\n", "TASK", "STATUS", "NEEDS")
-	fmt.Fprintf(stdout, "%-30s %-10s %s\n", "----", "------", "-----")
+	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-40s %s\n", "TASK", "STATUS", "ATTEMPTS", "LAST ERROR", "NEEDS")
+	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-40s %s\n", "----", "------", "--------", "----------", "-----")
 
 	for _, t := range tasks {
 		var status string
@@ -641,7 +754,18 @@ func runStatus(args []string, stdout io.Writer) error {
 		if needs == "" {
 			needs = "-"
 		}
-		fmt.Fprintf(stdout, "%-30s %-10s %s\n", t.ID, status, needs)
+		var attempts int
+		lastErr := "-"
+		if ts := state.Tasks[t.ID]; ts != nil {
+			attempts = ts.Attempts
+			if ts.LastError != "" {
+				lastErr = ts.LastError
+				if len(lastErr) > 38 {
+					lastErr = lastErr[:37] + "…"
+				}
+			}
+		}
+		fmt.Fprintf(stdout, "%-30s %-10s %-8d %-40s %s\n", t.ID, status, attempts, lastErr, needs)
 	}
 
 	fmt.Fprintf(stdout, "\n%d/%d tasks done, %d runnable\n", doneCount, len(tasks), runnableCount)
@@ -653,6 +777,9 @@ const defaultModel = "claude-sonnet-4-6"
 
 // planDefaultModel is the default model for the plan command.
 const planDefaultModel = "claude-opus-4-6"
+
+// genPromptsDefaultModel is the default model for the gen-prompts command.
+const genPromptsDefaultModel = "claude-opus-4-6"
 
 // resolveModel returns the effective model name using the precedence:
 // 1. flag value (if non-empty)
@@ -680,6 +807,107 @@ var commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
 
 // sleepFn is used to sleep between retry attempts. Swappable in tests.
 var sleepFn = time.Sleep
+
+func runGenPrompts(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("gen-prompts", flag.ContinueOnError)
+	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
+	prdFile := fs.String("prd", "PRD.md", "path to PRD file")
+	templateFile := fs.String("template", ".kiln/templates/<id>.md", "path to prompt template")
+	modelFlag := fs.String("model", "", "model override")
+	timeoutStr := fs.String("timeout", "15m", "timeout per Claude invocation")
+	overwrite := fs.Bool("overwrite", false, "regenerate prompts even when file already exists")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	prdData, err := os.ReadFile(*prdFile)
+	if err != nil {
+		return fmt.Errorf("failed to read PRD file %q: %w", *prdFile, err)
+	}
+
+	templateData, err := os.ReadFile(*templateFile)
+	if err != nil {
+		return fmt.Errorf("failed to read template file %q: %w", *templateFile, err)
+	}
+
+	timeout, err := time.ParseDuration(*timeoutStr)
+	if err != nil {
+		return fmt.Errorf("invalid --timeout value: %w", err)
+	}
+
+	model := resolveModel(*modelFlag, genPromptsDefaultModel)
+
+	var generated, skipped int
+	for _, task := range tasks {
+		promptPath := task.Prompt
+
+		if _, statErr := os.Stat(promptPath); statErr == nil && !*overwrite {
+			skipped++
+			continue
+		}
+
+		metaPrompt := buildGenPromptsMetaPrompt(string(templateData), string(prdData), task.ID, promptPath)
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		cmd := commandBuilder(ctx, metaPrompt, model)
+		cmd.Stdout = stdout
+		cmd.Stderr = stdout
+
+		runErr := cmd.Run()
+		cancel()
+
+		if runErr != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return fmt.Errorf("task %q timed out after %s", task.ID, timeout)
+			}
+			return fmt.Errorf("task %q: claude invocation failed: %w", task.ID, runErr)
+		}
+
+		if _, statErr := os.Stat(promptPath); statErr != nil {
+			return fmt.Errorf("task %q: prompt file %q was not created", task.ID, promptPath)
+		}
+
+		generated++
+	}
+
+	fmt.Fprintf(stdout, "gen-prompts: generated %d, skipped %d\n", generated, skipped)
+	return nil
+}
+
+// buildGenPromptsMetaPrompt constructs the meta-prompt sent to Claude for generating a task prompt file.
+func buildGenPromptsMetaPrompt(template, prd, taskID, outputPath string) string {
+	return fmt.Sprintf(`You are generating a task prompt file for the kiln CLI tool.
+
+TEMPLATE STRUCTURE:
+%s
+
+PRD CONTENT:
+%s
+
+TASK ID: %s
+
+INSTRUCTIONS:
+1. Fill in the template above for task ID "%s".
+2. Replace <task-id> with the actual task ID: %s
+3. Write specific, actionable task instructions derived from the PRD for this task.
+4. Include concrete acceptance criteria relevant to this task.
+5. The JSON footer MUST use {"kiln":{"status":"complete","task_id":"%s"}} NOT {"agentrun":...}.
+6. Write the complete filled-in prompt file to: %s
+
+The output file must follow the template structure exactly with:
+- TASK ID section containing: %s
+- SCOPE focused on this specific task only
+- REQUIREMENTS specific to what this task implements
+- ACCEPTANCE CRITERIA with testable criteria for this task
+- OUTPUT FORMAT CONTRACT using the kiln JSON footer with task_id "%s"
+`, template, prd, taskID, taskID, taskID, taskID, outputPath, taskID, taskID)
+}
 
 // maxBackoffDuration is the upper cap for exponential backoff delays.
 const maxBackoffDuration = 5 * time.Minute
@@ -739,6 +967,8 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	// Resolve prompt and model from tasks.yaml.
 	// Load tasks.yaml when explicitly provided or when --prompt-file is absent (use default).
 	var taskModel string
+	var taskRetries int
+	var taskEnv map[string]string
 	if tasksExplicit || *promptFile == "" {
 		tasks, err := loadTasks(*tasksFlag)
 		if err != nil {
@@ -755,6 +985,8 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 			return 0, fmt.Errorf("task %q not found in %s", *taskID, *tasksFlag)
 		}
 		taskModel = found.Model
+		taskRetries = found.Retries
+		taskEnv = found.Env
 		if *promptFile == "" {
 			if found.Prompt == "" {
 				return 0, fmt.Errorf("task %q has no prompt field", *taskID)
@@ -788,14 +1020,38 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	prompt := string(data)
 
 	model := resolveModel(*modelFlag, taskModel)
-	maxAttempts := 1 + *retriesFlag
+	retries := *retriesFlag
+	if taskRetries > 0 {
+		retries = taskRetries
+	}
+	maxAttempts := 1 + retries
 	logDir := ".kiln/logs"
+	stateFile := ".kiln/state.json"
+
+	// Load state before execution; ignore errors (treat as empty state).
+	state, stateErr := loadState(stateFile)
+	if stateErr != nil {
+		fmt.Fprintf(stdout, "warning: failed to load state: %v\n", stateErr)
+		state = &StateManifest{Tasks: make(map[string]*TaskState)}
+	}
+	if state.Tasks[*taskID] == nil {
+		state.Tasks[*taskID] = &TaskState{Status: "pending"}
+	}
+	ts := state.Tasks[*taskID]
 
 	var lastErr error
 	var lastLog execRunLog
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, stdout)
+		// Update state to "running" before each attempt.
+		ts.Status = "running"
+		ts.Attempts++
+		ts.LastAttemptAt = time.Now()
+		if saveErr := saveState(stateFile, state); saveErr != nil {
+			fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+		}
+
+		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, stdout, taskEnv)
 
 		// Always write the log, even on error.
 		if writeErr := writeExecLog(logDir, *taskID, log); writeErr != nil {
@@ -804,6 +1060,19 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 
 		if err == nil {
 			if log.FooterValid {
+				// Task completed successfully.
+				ts.Status = "completed"
+				ts.CompletedAt = log.EndedAt
+				ts.DurationMs = log.DurationMs
+				ts.Model = log.Model
+				ts.LastError = ""
+				ts.LastErrorClass = ""
+				if log.Footer != nil {
+					ts.Notes = log.Footer.Kiln.Notes
+				}
+				if saveErr := saveState(stateFile, state); saveErr != nil {
+					fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+				}
 				doneDir := ".kiln/done"
 				if mkErr := os.MkdirAll(doneDir, 0o755); mkErr == nil {
 					donePath := filepath.Join(doneDir, *taskID+".done")
@@ -811,11 +1080,30 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 				}
 				return 2, nil
 			}
+			// not_complete or blocked.
+			taskStatus := "failed"
+			if log.Status == "blocked" {
+				taskStatus = "blocked"
+			}
+			ts.Status = taskStatus
+			ts.DurationMs = log.DurationMs
+			ts.Model = log.Model
+			if saveErr := saveState(stateFile, state); saveErr != nil {
+				fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+			}
 			return 0, nil
 		}
 
 		lastErr = err
 		lastLog = log
+
+		// Update state to "failed" after an error attempt.
+		ts.Status = "failed"
+		ts.LastError = err.Error()
+		ts.LastErrorClass = classifyError(err)
+		if saveErr := saveState(stateFile, state); saveErr != nil {
+			fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+		}
 
 		if !isRetryable(err) {
 			return lastLog.ExitCode, lastErr
@@ -830,7 +1118,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 }
 
 // execOnce runs a single claude invocation attempt and returns a structured log entry and any error.
-func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, stdout io.Writer) (execRunLog, error) {
+func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, stdout io.Writer, taskEnv map[string]string) (execRunLog, error) {
 	startedAt := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -844,6 +1132,27 @@ func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, s
 	stderrCapture := newLineCapture(stdout, "stderr", &mu, &events)
 
 	cmd := commandBuilder(ctx, prompt, model)
+	if len(taskEnv) > 0 {
+		baseEnv := cmd.Env
+		if baseEnv == nil {
+			baseEnv = os.Environ()
+		}
+		envMap := make(map[string]string, len(baseEnv))
+		for _, e := range baseEnv {
+			parts := strings.SplitN(e, "=", 2)
+			if len(parts) == 2 {
+				envMap[parts[0]] = parts[1]
+			}
+		}
+		for k, v := range taskEnv {
+			envMap[k] = v
+		}
+		newEnv := make([]string, 0, len(envMap))
+		for k, v := range envMap {
+			newEnv = append(newEnv, k+"="+v)
+		}
+		cmd.Env = newEnv
+	}
 	cmd.Stdout = stdoutCapture
 	cmd.Stderr = stderrCapture
 

@@ -1,0 +1,63 @@
+- id: state-resumability
+  prompt: .kiln/prompts/tasks/state-resumability.md
+  needs: []
+  phase: 1
+
+- id: richer-task-schema
+  prompt: .kiln/prompts/tasks/richer-task-schema.md
+  needs: []
+  phase: 1
+
+- id: concurrency-safety
+  prompt: .kiln/prompts/tasks/concurrency-safety.md
+  needs:
+    - state-resumability
+  phase: 2
+
+- id: error-taxonomy
+  prompt: .kiln/prompts/tasks/error-taxonomy.md
+  needs:
+    - state-resumability
+  phase: 2
+
+- id: validation-hooks
+  prompt: .kiln/prompts/tasks/validation-hooks.md
+  needs:
+    - richer-task-schema
+  phase: 3
+
+- id: prompt-chaining
+  prompt: .kiln/prompts/tasks/prompt-chaining.md
+  needs:
+    - state-resumability
+  phase: 3
+
+- id: machine-readable-output
+  prompt: .kiln/prompts/tasks/machine-readable-output.md
+  needs: []
+  phase: 4
+
+- id: kiln-init
+  prompt: .kiln/prompts/tasks/kiln-init.md
+  needs:
+    - richer-task-schema
+  phase: 4
+
+- id: interactive-tui
+  prompt: .kiln/prompts/tasks/interactive-tui.md
+  needs:
+    - state-resumability
+    - error-taxonomy
+  phase: 4
+
+- id: git-automation
+  prompt: .kiln/prompts/tasks/git-automation.md
+  needs:
+    - validation-hooks
+  phase: 5
+
+- id: engine-abstraction
+  prompt: .kiln/prompts/tasks/engine-abstraction.md
+  needs:
+    - richer-task-schema
+  phase: 5

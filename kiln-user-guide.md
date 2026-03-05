@@ -14,12 +14,21 @@ go build -o kiln ./cmd/kiln
 vim PRD.md
 
 # 3. Generate the task graph from your PRD
-make plan
+kiln plan
 
-# 4. Generate Make targets from the task graph
+# 4. Review and edit .kiln/tasks.yaml (optional but recommended)
+vim .kiln/tasks.yaml
+
+# 5. Generate prompt files for each task
+kiln gen-prompts
+
+# 6. Review and edit prompt files (optional but recommended)
+ls .kiln/prompts/tasks/
+
+# 7. Generate Make targets from the task graph
 make graph
 
-# 5. Run all tasks (respecting dependencies)
+# 8. Run all tasks (respecting dependencies)
 make all
 ```
 
@@ -27,9 +36,12 @@ make all
 
 ```
 PRD.md
-  |  (make plan / kiln plan)
+  |  (kiln plan)
   v
-.kiln/tasks.yaml
+.kiln/tasks.yaml          <-- review/edit
+  |  (kiln gen-prompts)
+  v
+.kiln/prompts/tasks/*.md   <-- review/edit
   |  (make graph / kiln gen-make)
   v
 .kiln/targets.mk
@@ -88,6 +100,30 @@ kiln exec --task-id my-task --prompt-file path/to/prompt.md
 
 ```bash
 kiln exec --task-id my-task --retries 3 --retry-backoff 10s --backoff exponential
+```
+
+### `kiln gen-prompts`
+
+Reads `.kiln/tasks.yaml` and generates prompt files (`.kiln/prompts/tasks/<id>.md`) for tasks that don't already have one. Uses Claude (opus by default) to produce task-specific prompts based on the PRD and the prompt template.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tasks` | `.kiln/tasks.yaml` | Path to the tasks file |
+| `--prd` | `PRD.md` | Path to the PRD file (provides context for prompt generation) |
+| `--template` | `.kiln/templates/<id>.md` | Path to the prompt template |
+| `--model` | See [Model Selection](#model-selection) | Claude model to use (default: `claude-opus-4-6`) |
+| `--timeout` | `15m` | Timeout per Claude invocation |
+| `--overwrite` | `false` | Regenerate prompts even when the file already exists |
+
+```bash
+# Generate missing prompt files
+kiln gen-prompts
+
+# Use a different PRD as context
+kiln gen-prompts --prd BACKLOG.md
+
+# Regenerate all prompt files (including existing ones)
+kiln gen-prompts --overwrite
 ```
 
 ### `kiln gen-make`
@@ -187,7 +223,7 @@ Model is resolved in this order of precedence:
 1. `--model` flag (highest priority)
 2. `model` field in tasks.yaml for the current task (exec only)
 3. `KILN_MODEL` environment variable
-4. Command default: `claude-opus-4-6` for `plan`, `claude-sonnet-4-6` for everything else
+4. Command default: `claude-opus-4-6` for `plan` and `gen-prompts`, `claude-sonnet-4-6` for everything else
 
 ```bash
 # Use env var for all tasks
@@ -245,10 +281,12 @@ A `.kiln/done/<id>.done` marker is only created when status is `complete` **and*
 .kiln/
   tasks.yaml              # Task dependency graph
   targets.mk              # Generated Make include file
+  templates/
+    <id>.md               # Prompt template used by gen-prompts
   prompts/
     00_extract_tasks.md    # Plan extraction prompt
     tasks/
-      <task-id>.md         # Per-task prompt files
+      <task-id>.md         # Per-task prompt files (generated or hand-written)
   logs/
     <task-id>.json         # Per-task execution logs (one per attempt)
   done/
@@ -290,6 +328,82 @@ The provided `Makefile` exposes three workflow targets:
 | `make clean` | `rm -rf` | Remove .kiln/done, .kiln/logs, and targets.mk |
 
 Make handles parallelism natively. Use `make -j4 all` to run up to 4 independent tasks concurrently.
+
+## End-to-End Workflow
+
+This section walks through using kiln to implement features from a PRD or backlog document.
+
+### Step 1: Generate the task graph
+
+```bash
+kiln plan --prd BACKLOG.md
+```
+
+Review `.kiln/tasks.yaml` after generation. You may want to:
+- Adjust task granularity (one Claude session per task)
+- Tighten or loosen dependencies
+- Scope to a single phase rather than the entire backlog
+
+### Step 2: Generate prompt files
+
+```bash
+kiln gen-prompts --prd BACKLOG.md
+```
+
+This scaffolds `.kiln/prompts/tasks/<id>.md` for each task that doesn't have a prompt file yet. Review the generated prompts — they're a starting point. Tighten acceptance criteria or add codebase-specific context as needed.
+
+### Step 3: Generate Make targets and run
+
+```bash
+make graph
+make -j4 all
+```
+
+Make resolves the dependency graph, runs independent tasks in parallel, and calls `kiln exec --task-id <id>` for each. Tasks that complete successfully get `.done` markers; Make skips them on subsequent runs.
+
+### Step 4: Monitor and iterate
+
+```bash
+kiln status --tasks .kiln/tasks.yaml
+```
+
+Re-run `make all` to retry failed or incomplete tasks. The `.done` markers make this idempotent — only unfinished work gets re-executed.
+
+### Phased execution
+
+For large backlogs, scope each run to one phase:
+
+1. Edit `tasks.yaml` to include only Phase 1 tasks
+2. Run `make graph && make all`
+3. Verify results, rebuild if needed (`go build -o kiln ./cmd/kiln`)
+4. Add Phase 2 tasks to `tasks.yaml`, generate their prompts
+5. Repeat
+
+This is especially important when kiln is building itself — changes to `cmd/kiln/main.go` during a task run could affect subsequent tasks. Rebuilding the binary between phases ensures each phase uses stable tooling.
+
+### Running a single task manually
+
+```bash
+kiln exec --task-id my-task
+kiln exec --task-id my-task --retries 2 --retry-backoff 10s --backoff exponential
+```
+
+### Resetting a completed task
+
+Delete its done marker and re-run:
+
+```bash
+rm .kiln/done/my-task.done
+make all
+```
+
+### Full reset
+
+```bash
+make clean        # removes .kiln/done/, .kiln/logs/, and targets.mk
+make graph        # regenerate targets
+make all          # re-run everything
+```
 
 ## Build and Test
 

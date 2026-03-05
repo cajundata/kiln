@@ -142,7 +142,24 @@ Kiln has exit codes but doesn't define:
 
 ---
 
-## 10. Optional Git Automation
+## 10. Interactive TUI Dashboard
+
+A terminal UI for monitoring and controlling kiln runs in real time:
+
+- Live task graph visualization showing done/running/blocked/runnable states
+- Real-time log streaming for the currently executing task
+- Manual task controls: trigger, retry, skip, or reset individual tasks
+- Summary panel: total progress, elapsed time, error counts
+- Keyboard navigation to drill into task details, logs, and footer output
+- Color-coded status indicators matching `kiln status` semantics
+
+**Why:** `kiln status` is a snapshot; `make -jN` output interleaves multiple tasks into unreadable noise. A TUI gives live observability over the full graph without leaving the terminal. This becomes critical once task graphs exceed 10-15 tasks and parallel execution is the norm.
+
+**Recommendation:** Build with [Bubble Tea](https://github.com/charmbracelet/bubbletea) (Go-native TUI framework). Start with a read-only dashboard (`kiln tui`) that tails logs and polls state, then add interactive controls. Depends on #1 (state file) for reliable status tracking beyond `.done` markers.
+
+---
+
+## 11. Optional Git Automation
 
 Explicitly a non-goal for MVP, but future candidates include:
 
@@ -186,25 +203,27 @@ Explicitly a non-goal for MVP, but future candidates include:
 |----------|---------|-----------|
 | **P7** | **#5 Machine-Readable Output** | `--format json|text` for `kiln exec` and `kiln gen-make`. No dependencies. Small scope — already writes JSON logs. Could be done earlier if CI integration is urgent. |
 | **P8** | **#4 `kiln init`** | Scaffolding generator. No code dependencies, but benefits from #7 so templates are accurate. Better to wait until schema settles. |
+| **P9** | **#10 Interactive TUI** | Read-only dashboard first (`kiln tui`), then interactive controls. Depends on: #1 (state file for reliable live status). Benefits from #9 (error taxonomy feeds the summary panel). Natural fit alongside #5 since both are observability improvements. |
 
 ### Phase 5 — Abstraction & Extensibility (last, highest complexity)
 
 | Priority | Feature | Rationale |
 |----------|---------|-----------|
-| **P9** | **#10 Git Automation** | Opt-in git integration (verify commits, auto-commit, branch-per-task, PR hooks). Benefits from #3 (validation hooks can include "verify commit exists"). Lower refactor surface than engine abstraction. |
-| **P10** | **#2 Engine Abstraction** | Multi-engine support requires an `Engine` interface wrapping `commandBuilder`, `parseFooter`, and error classification. Depends on: #7 (per-task engine field). Highest refactor surface — touches `execOnce`, `commandBuilder`, `parseFooter`, and error types. Do this last, after the core is stable and a second engine is actually needed. |
+| **P10** | **#11 Git Automation** | Opt-in git integration (verify commits, auto-commit, branch-per-task, PR hooks). Benefits from #3 (validation hooks can include "verify commit exists"). Lower refactor surface than engine abstraction. |
+| **P11** | **#2 Engine Abstraction** | Multi-engine support requires an `Engine` interface wrapping `commandBuilder`, `parseFooter`, and error classification. Depends on: #7 (per-task engine field). Highest refactor surface — touches `execOnce`, `commandBuilder`, `parseFooter`, and error types. Do this last, after the core is stable and a second engine is actually needed. |
 
 ---
 
 ## Dependency Graph
 
 ```
-#7 Richer Schema ──────┬──→ #3 Validation Hooks ──→ #10 Git Automation
+#7 Richer Schema ──────┬──→ #3 Validation Hooks ──→ #11 Git Automation
                        ├──→ #2 Engine Abstraction
                        │
 #1 State & Resumability┬──→ #8 Prompt Chaining
-                       ├──→ #9 Error Taxonomy
+                       ├──→ #9 Error Taxonomy ──→ #10 TUI (benefits)
                        ├──→ #6 Concurrency Safety (soft)
+                       ├──→ #10 Interactive TUI
                        │
 #5 Machine-Readable Output  (independent)
 #4 kiln init                (independent, benefits from #7)
@@ -218,4 +237,5 @@ Explicitly a non-goal for MVP, but future candidates include:
 2. **#5 (JSON output) is a wildcard** — if CI integration is needed soon, bump it to Phase 1. It's trivially small.
 3. **#2 (engine abstraction) is deliberately last** — it's the largest refactor and isn't needed until a second engine is actually required. Premature abstraction here would slow down everything else.
 4. **#6 (concurrency) is more urgent than it looks** — if anyone runs `make -j3` today, there are no guards. Consider pairing it with #1.
-5. **#10 (git automation) before #2** — git integration has a smaller refactor surface and benefits from validation hooks (#3) already being in place, making it a natural next step before tackling the engine abstraction.
+5. **#11 (git automation) before #2** — git integration has a smaller refactor surface and benefits from validation hooks (#3) already being in place, making it a natural next step before tackling the engine abstraction.
+6. **#10 (TUI) in Phase 4** — it's a UX feature with no downstream dependents, so it doesn't block anything. But it hard-depends on #1 (state file) for live status beyond `.done` markers, and benefits significantly from #9 (error taxonomy feeds the summary panel). Building it before Phase 4 would mean reimplementing status tracking that #1 already provides.

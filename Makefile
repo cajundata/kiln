@@ -1,8 +1,14 @@
 # ---- Config ----
-KILN := ./kiln
+KILN := ./bin/kiln
 PROMPT_DIR := .kiln/prompts
 TASKS_FILE := .kiln/tasks.yaml
 TARGETS_FILE := .kiln/targets.mk
+
+# ---- Auto-build binary when source changes ----
+$(KILN): cmd/kiln/main.go
+	@echo "kiln: rebuilding $(KILN)..."
+	@go build -o $(KILN) ./cmd/kiln
+	@echo "kiln: build complete"
 
 # ---- Generated targets (conditionally included) ----
 -include $(TARGETS_FILE)
@@ -11,11 +17,11 @@ TARGETS_FILE := .kiln/targets.mk
 .PHONY: plan graph clean
 
 # Generate tasks.yaml from PRD.md
-plan:
+plan: $(KILN)
 	$(KILN) plan
 
 # Generate Make targets from tasks.yaml
-graph:
+graph: $(KILN)
 	$(KILN) gen-make \
 		--tasks $(TASKS_FILE) \
 		--out $(TARGETS_FILE)
