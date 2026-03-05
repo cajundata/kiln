@@ -1,48 +1,75 @@
-# Task: Structured logging for kiln exec
+# Task: exec-logging — structured logs, footer capture, and status-friendly output
 
 ## Role
+You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Implement focused, minimal changes with tests.
 
-You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Your job is to implement focused, minimal changes.
+## Goal
+Upgrade `kiln exec` logging so that:
+- Each run produces a single JSON log file that is easy to consume.
+- The run captures the final JSON footer and validates it.
+- `kiln status` (later) can rely on `.kiln/done/*.done` and optionally cross-check logs.
 
----
+This task assumes:
+- A `.kiln/logs/<task-id>.json` log file already exists in minimal form.
+- `.kiln/done/<task-id>.done` is created only when a valid footer is detected (per your policy).
 
-## Context
+## Log file format (v1)
+Write JSON with this top-level shape:
 
-`kiln exec` writes raw claude output to `.kiln/logs/<task-id>.json`. We need structured logging that records all attempts, timing, and the final classification.
+```json
+{
+  "task_id": "exec-footer",
+  "started_at": "RFC3339",
+  "ended_at": "RFC3339",
+  "duration_ms": 1234,
+  "model": "claude-sonnet-4-6",
+  "prompt_file": ".kiln/prompts/tasks/exec-footer.md",
+  "exit_code": 0,
+  "status": "success|timeout|error",
+  "footer": { "kiln": { "status": "complete", "task_id": "exec-footer", "notes": "..." } },
+  "footer_valid": true,
+  "events": [
+    { "ts": "RFC3339", "type": "stdout", "line": "..." },
+    { "ts": "RFC3339", "type": "stderr", "line": "..." }
+  ]
+}
+```
 
----
+Notes:
+- Keep it compact; limit event buffering if necessary (but don’t drop footer parsing).
+- If you already store the raw Claude stream-json, you may store it under a separate key, but keep `events` usable.
 
-## Requirements
+## Footer handling rules
+1. Footer is expected to be the final JSON object printed by the model to stdout.
+2. Footer must parse as JSON and contain:
+   - `kiln.status == "complete"`
+   - `kiln.task_id` matches the current task id
+3. If footer is missing/invalid:
+   - `footer_valid=false`
+   - do not create `.kiln/done/<task>.done` (ensure logging matches this)
+4. If command times out:
+   - `status="timeout"`, `exit_code` should reflect your timeout exit code policy
+   - include an error message field if you already have one
 
-### 1. Structured log format
+## Implementation notes
+- Capture stdout/stderr streams.
+- Continue writing to console as today, but ensure log output is always written even on errors/timeouts.
+- Make log writes atomic: write to temp then rename to `.kiln/logs/<task-id>.json`.
 
-Each log file at `.kiln/logs/<task-id>.json` should contain a JSON object with:
-- `task_id`: the task identifier
-- `attempts`: array of attempt objects, each with:
-  - `attempt`: attempt number (1-based)
-  - `started_at`: ISO 8601 timestamp
-  - `ended_at`: ISO 8601 timestamp
-  - `exit_code`: the raw exit code from the claude process
-  - `timed_out`: boolean
-- `final_status`: the parsed footer status (or `"unknown"` if no footer)
-- `final_exit_code`: the exit code kiln used
+## Tests
+Add tests covering:
+- success run with valid footer -> footer_valid=true and log contains footer object
+- success run but missing footer -> footer_valid=false
+- footer task_id mismatch -> footer_valid=false
+- timeout -> status=timeout with footer_valid=false
+- log file always created
 
-### 2. Always write logs
+Use the existing fake helper process pattern if present.
 
-- Logs must be written on every run, even on failure.
-- Each retry attempt appends to the attempts array.
-
----
-
-## Acceptance Criteria
-
-- `.kiln/logs/<task-id>.json` contains valid structured JSON after every run.
-- All attempt details (timing, exit codes, timeout status) are recorded.
-- The log includes the final classification.
-- The code builds with `go build -o kiln ./cmd/kiln`.
-
----
+## Acceptance criteria
+- `go test ./...` passes
+- logs are valid JSON and include footer parsing results
+- behavior matches policy: `.done` only created when footer is valid
 
 ## Final JSON Status Footer
-
-{"kiln":{"status":"complete","task_id":"exec-logging","notes":"implemented structured JSON logging with attempt tracking"}}
+{"kiln":{"status":"complete","task_id":"exec-logging","notes":"Implemented structured exec logs with validated footer capture."}}

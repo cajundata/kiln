@@ -1,62 +1,62 @@
-# Task: Implement tasks.yaml schema validation
+# Task: validate-schema — parse tasks.yaml, validate shape, and normalize
 
 ## Role
+You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Implement focused, minimal changes with tests.
 
-You are an assistant developer working inside an existing Go codebase for a CLI tool named `kiln`. Your job is to implement focused, minimal changes.
+## Goal
+Implement `kiln validate-schema` that validates `.kiln/tasks.yaml` and provides a stable normalized representation for downstream commands (`validate-cycles`, `gen-make`, `exec --tasks`, `status`).
 
----
-
-## Context
-
-`kiln gen-make` needs to read and validate `.kiln/tasks.yaml` before generating Make targets. This task implements the schema validation step.
-
-The tasks.yaml file is a YAML sequence (list) of task objects:
-
-```yaml
-- id: exec-timeout
-  prompt: .kiln/prompts/tasks/exec-timeout.md
-  needs: []
+## CLI
+```bash
+kiln validate-schema --tasks .kiln/tasks.yaml
 ```
 
----
+## Tasks.yaml schema (v1)
+Each task item:
+- `id` (string, required, non-empty, unique)
+- `prompt` (string, required, non-empty)
+- `needs` (list of string, optional; default empty)
+- `model` (string, optional; if empty treat as unset)
 
-## Requirements
+Notes:
+- Preserve backward compatibility: existing files without `model` must still validate.
+- Unknown fields are an error (strict schema), unless you already have an established policy in the codebase.
 
-### 1. Parse tasks.yaml
+## Validation requirements
+1. YAML parse errors -> return non-zero / error with message `failed to parse tasks file`.
+2. Empty list -> error `no tasks found`.
+3. Unique IDs -> error if duplicates; message should mention duplicate id.
+4. Required fields -> error if `id` or `prompt` missing/empty.
+5. Needs type -> if present, must be list of strings; no nulls.
+6. Model type -> if present, must be string (allow empty string but treat as unset).
+7. Path sanity (lightweight):
+   - `prompt` must be a relative path (no absolute paths), OR document and enforce existing project convention.
+   - Do not require the prompt file to exist here (that is `exec`’s job).
 
-- Read and parse the YAML file specified by the `--tasks` flag.
-- Deserialize into Go structs.
+## Output behavior
+- On success: print a concise success line to stdout, e.g. `validate-schema: OK (<N> tasks)`.
+- Do not rewrite the file.
 
-### 2. Validate schema
+## Code structure
+- Introduce a `Task` struct representing the YAML shape.
+- Create a loader function (e.g. `loadTasks(path) ([]Task, error)`) that both validate-schema and other commands can reuse.
 
-- The root must be a YAML sequence (list).
-- Each task must have:
-  - `id`: string matching `^[a-z0-9]+(-[a-z0-9]+)*$`
-  - `prompt`: string path
-  - `needs`: optional list of strings (default to empty)
-- No duplicate task IDs.
-- All `needs` entries must reference existing task IDs.
-- Prompt files must exist on disk (unless `--allow-missing-prompts` is passed).
+## Tests
+Add tests covering:
+- invalid YAML
+- empty tasks
+- missing id/prompt
+- duplicate ids
+- needs wrong type
+- model wrong type
+- success case with model present and absent
 
-### 3. Error reporting
+Prefer table-driven tests.
 
-- On validation failure, print a clear error including:
-  - The offending task id (if applicable)
-  - The field name
-  - Expected format (with example)
-- Exit with non-zero status on validation failure.
-
----
-
-## Acceptance Criteria
-
-- Valid tasks.yaml files pass validation.
-- Invalid files produce clear, actionable error messages.
-- Missing fields, bad IDs, and dangling needs references are caught.
-- The code builds with `go build -o kiln ./cmd/kiln`.
-
----
+## Acceptance criteria
+- `go test ./...` passes
+- `kiln validate-schema --tasks .kiln/tasks.yaml` succeeds for the current repository tasks file
+- Error messages match expectations in tests
 
 ## Final JSON Status Footer
-
-{"kiln":{"status":"complete","task_id":"validate-schema","notes":"implemented tasks.yaml schema validation with clear error messages"}}
+{"kiln":{"status":"complete","task_id":"validate-schema","notes":"Implemented strict tasks.yaml schema validation and reusable loader."}}
