@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,20 +154,77 @@ type kilnFooterEnvelope struct {
 
 // parseFooter scans output lines (last-first) for a valid kiln JSON footer.
 // Returns status, task_id, and true when found; empty strings and false otherwise.
+// Handles both standalone footer lines and footers embedded within stream-json output.
 func parseFooter(output string) (status, taskID string, ok bool) {
 	lines := strings.Split(output, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
-		if !strings.Contains(line, `"kiln"`) {
+		if !strings.Contains(line, `"kiln"`) && !strings.Contains(line, `\"kiln\"`) {
 			continue
 		}
+		// Try parsing the whole line as a bare footer.
 		var env kilnFooterEnvelope
-		if err := json.Unmarshal([]byte(line), &env); err != nil {
-			continue
-		}
-		if env.Kiln.Status != "" {
+		if err := json.Unmarshal([]byte(line), &env); err == nil && env.Kiln.Status != "" {
 			return env.Kiln.Status, env.Kiln.TaskID, true
 		}
+		// Footer may be embedded inside a stream-json text field.
+		// Extract string values and check each for the footer.
+		for _, text := range extractStreamJSONTexts(line) {
+			if s, id, found := tryParseFooterInText(text); found {
+				return s, id, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// extractStreamJSONTexts extracts text content from known stream-json message structures.
+func extractStreamJSONTexts(line string) []string {
+	var msg struct {
+		Result  string `json:"result"`
+		Message struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal([]byte(line), &msg) != nil {
+		return nil
+	}
+	var texts []string
+	if msg.Result != "" {
+		texts = append(texts, msg.Result)
+	}
+	for _, c := range msg.Message.Content {
+		if c.Text != "" {
+			texts = append(texts, c.Text)
+		}
+	}
+	return texts
+}
+
+// tryParseFooterInText searches a text string for an embedded kiln footer JSON object.
+func tryParseFooterInText(text string) (status, taskID string, ok bool) {
+	for idx := 0; idx < len(text); idx++ {
+		pos := strings.Index(text[idx:], `{"kiln":`)
+		if pos < 0 {
+			break
+		}
+		candidate := text[idx+pos:]
+		var env kilnFooterEnvelope
+		if err := json.Unmarshal([]byte(candidate), &env); err == nil && env.Kiln.Status != "" {
+			return env.Kiln.Status, env.Kiln.TaskID, true
+		}
+		// Try truncating at each '}' from the end in case of trailing text.
+		for j := len(candidate) - 1; j >= 0; j-- {
+			if candidate[j] == '}' {
+				sub := candidate[:j+1]
+				if err := json.Unmarshal([]byte(sub), &env); err == nil && env.Kiln.Status != "" {
+					return env.Kiln.Status, env.Kiln.TaskID, true
+				}
+			}
+		}
+		idx += pos + 1
 	}
 	return "", "", false
 }
@@ -196,6 +255,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return code
+	case "plan":
+		if err := runPlan(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "plan: %v\n", err)
+			return 1
+		}
+		return 0
 	case "gen-make":
 		if err := runGenMake(args[1:]); err != nil {
 			fmt.Fprintf(stderr, "gen-make: %v\n", err)
@@ -398,6 +463,64 @@ func runValidateSchema(args []string, stdout io.Writer) error {
 	return nil
 }
 
+func runPlan(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	prdFile := fs.String("prd", "PRD.md", "path to PRD file")
+	promptFile := fs.String("prompt", ".kiln/prompts/00_extract_tasks.md", "path to extraction prompt")
+	outFile := fs.String("out", ".kiln/tasks.yaml", "output path for tasks.yaml")
+	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
+	timeoutStr := fs.String("timeout", "15m", "maximum duration for the claude invocation")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	prdData, err := os.ReadFile(*prdFile)
+	if err != nil {
+		return fmt.Errorf("failed to read PRD file %q: %w", *prdFile, err)
+	}
+
+	promptData, err := os.ReadFile(*promptFile)
+	if err != nil {
+		return fmt.Errorf("failed to read prompt file %q: %w", *promptFile, err)
+	}
+
+	timeout, err := time.ParseDuration(*timeoutStr)
+	if err != nil {
+		return fmt.Errorf("invalid --timeout value: %w", err)
+	}
+
+	// Build combined prompt: inject PRD content and output path so Claude
+	// does not need to read from disk and writes to the correct location.
+	combined := fmt.Sprintf(
+		"%s\n\nOVERRIDE: Write the output YAML to %q (not any hardcoded path).\n\nPRD CONTENT:\n%s",
+		string(promptData), *outFile, string(prdData),
+	)
+
+	model := resolveModel(*modelFlag, planDefaultModel)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := commandBuilder(ctx, combined, model)
+	cmd.Stdout = stdout
+	cmd.Stderr = stdout
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("plan timed out after %s", timeout)
+		}
+		return fmt.Errorf("claude invocation failed: %w", err)
+	}
+
+	if _, err := loadTasks(*outFile); err != nil {
+		return fmt.Errorf("generated %s is invalid: %w", *outFile, err)
+	}
+
+	fmt.Fprintf(stdout, "plan: wrote %s\n", *outFile)
+	return nil
+}
+
 func runGenMake(args []string) error {
 	fs := flag.NewFlagSet("gen-make", flag.ContinueOnError)
 	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
@@ -443,7 +566,7 @@ func runGenMake(args []string) error {
 			buf.WriteString(" .kiln/done/" + dep + ".done")
 		}
 		buf.WriteString("\n")
-		recipe := "$(KILN) exec --task-id " + t.ID + " --tasks " + *tasksFile
+		recipe := "$(KILN) exec --task-id " + t.ID
 		if t.Timeout != "" {
 			recipe += " --timeout " + t.Timeout
 		}
@@ -528,6 +651,9 @@ func runStatus(args []string, stdout io.Writer) error {
 // defaultModel is the built-in fallback when neither --model nor KILN_MODEL is set.
 const defaultModel = "claude-sonnet-4-6"
 
+// planDefaultModel is the default model for the plan command.
+const planDefaultModel = "claude-opus-4-6"
+
 // resolveModel returns the effective model name using the precedence:
 // 1. flag value (if non-empty)
 // 2. task model from tasks.yaml (if non-empty)
@@ -555,16 +681,44 @@ var commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
 // sleepFn is used to sleep between retry attempts. Swappable in tests.
 var sleepFn = time.Sleep
 
+// maxBackoffDuration is the upper cap for exponential backoff delays.
+const maxBackoffDuration = 5 * time.Minute
+
+// computeBackoff returns the sleep duration before the next retry attempt.
+// strategy must be "fixed" or "exponential".
+// attempt is 1-indexed (attempt=1 means sleeping before the 2nd try).
+func computeBackoff(strategy string, base time.Duration, attempt int) time.Duration {
+	if strategy != "exponential" {
+		return base
+	}
+	// delay = base * 2^(attempt-1), capped at maxBackoffDuration
+	multiplier := math.Pow(2, float64(attempt-1))
+	scaled := float64(base) * multiplier
+	var delay time.Duration
+	if scaled >= float64(maxBackoffDuration) {
+		delay = maxBackoffDuration
+	} else {
+		delay = time.Duration(scaled)
+	}
+	// Jitter: add 0–50% of delay
+	if delay > 0 {
+		jitter := time.Duration(rand.Int63n(int64(delay/2) + 1))
+		delay += jitter
+	}
+	return delay
+}
+
 func runExec(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 
 	taskID := fs.String("task-id", "", "task identifier")
 	promptFile := fs.String("prompt-file", "", "path to prompt file")
-	tasksFlag := fs.String("tasks", "", "path to tasks.yaml (resolves prompt and model from task definition)")
+	tasksFlag := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml (resolves prompt and model from task definition)")
 	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
 	timeoutStr := fs.String("timeout", "15m", "maximum duration for the claude invocation")
 	retriesFlag := fs.Int("retries", 0, "number of additional attempts on retryable failures")
 	retryBackoffStr := fs.String("retry-backoff", "0s", "sleep duration between retry attempts")
+	backoffFlag := fs.String("backoff", "fixed", "backoff strategy between retries: fixed or exponential")
 
 	if err := fs.Parse(args); err != nil {
 		return 0, err
@@ -574,9 +728,18 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		return 0, fmt.Errorf("--task-id is required")
 	}
 
-	// Resolve prompt and model from tasks.yaml when --tasks is provided
+	// Determine whether --tasks was explicitly provided by the user.
+	tasksExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "tasks" {
+			tasksExplicit = true
+		}
+	})
+
+	// Resolve prompt and model from tasks.yaml.
+	// Load tasks.yaml when explicitly provided or when --prompt-file is absent (use default).
 	var taskModel string
-	if *tasksFlag != "" {
+	if tasksExplicit || *promptFile == "" {
 		tasks, err := loadTasks(*tasksFlag)
 		if err != nil {
 			return 0, err
@@ -601,7 +764,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	}
 
 	if *promptFile == "" {
-		return 0, fmt.Errorf("no prompt file: provide --prompt-file or --tasks to resolve from tasks.yaml")
+		return 0, fmt.Errorf("no prompt file: provide --prompt-file or ensure task has a prompt field in tasks.yaml")
 	}
 
 	timeout, err := time.ParseDuration(*timeoutStr)
@@ -612,6 +775,10 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	retryBackoff, err := time.ParseDuration(*retryBackoffStr)
 	if err != nil {
 		return 0, fmt.Errorf("invalid --retry-backoff value: %w", err)
+	}
+
+	if *backoffFlag != "fixed" && *backoffFlag != "exponential" {
+		return 0, fmt.Errorf("invalid --backoff value %q: must be fixed or exponential", *backoffFlag)
 	}
 
 	data, err := os.ReadFile(*promptFile)
@@ -655,7 +822,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		}
 
 		if attempt < maxAttempts && retryBackoff > 0 {
-			sleepFn(retryBackoff)
+			sleepFn(computeBackoff(*backoffFlag, retryBackoff, attempt))
 		}
 	}
 

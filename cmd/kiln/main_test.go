@@ -386,8 +386,11 @@ func TestRunGenMake_SingleTask(t *testing.T) {
 	if !strings.Contains(got, ".kiln/done/build-widget.done:") {
 		t.Error("missing build-widget target")
 	}
-	if !strings.Contains(got, "$(KILN) exec --task-id build-widget --tasks "+tasksPath) {
+	if !strings.Contains(got, "$(KILN) exec --task-id build-widget") {
 		t.Errorf("missing or incorrect recipe for build-widget, got:\n%s", got)
+	}
+	if strings.Contains(got, "--tasks") {
+		t.Error("recipe should not contain --tasks (exec defaults to .kiln/tasks.yaml)")
 	}
 	if strings.Contains(got, "&& touch $@") {
 		t.Error("recipe should not contain '&& touch $@'")
@@ -644,6 +647,21 @@ func TestHelperProcess(t *testing.T) {
 		// Sleep for a long time; will be killed by context timeout.
 		time.Sleep(1 * time.Hour)
 		os.Exit(0)
+	case "write-tasks":
+		// Write valid tasks.yaml to KILN_TEST_PLAN_OUT and exit 0.
+		outPath := os.Getenv("KILN_TEST_PLAN_OUT")
+		if outPath != "" {
+			validYAML := "- id: planned-task\n  prompt: planned.md\n"
+			os.WriteFile(outPath, []byte(validYAML), 0o644)
+		}
+		os.Exit(0)
+	case "write-invalid-yaml":
+		// Write invalid YAML to KILN_TEST_PLAN_OUT and exit 0.
+		outPath := os.Getenv("KILN_TEST_PLAN_OUT")
+		if outPath != "" {
+			os.WriteFile(outPath, []byte("not: valid: yaml: [[["), 0o644)
+		}
+		os.Exit(0)
 	default:
 		os.Stderr.WriteString("unknown helper mode\n")
 		os.Exit(2)
@@ -665,7 +683,8 @@ func TestRunExec_MissingPromptFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing prompt")
 	}
-	if !strings.Contains(err.Error(), "--prompt-file") && !strings.Contains(err.Error(), "--tasks") {
+	// With default --tasks=.kiln/tasks.yaml, error is about reading the tasks file
+	if !strings.Contains(err.Error(), "tasks") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -1169,8 +1188,11 @@ func TestRunGenMake_TaskWithTimeout(t *testing.T) {
 	}
 	got := string(data)
 
-	if !strings.Contains(got, "$(KILN) exec --task-id slow-task --tasks "+tasksPath+" --timeout 10m") {
-		t.Errorf("expected recipe with --tasks and --timeout flag, got:\n%s", got)
+	if !strings.Contains(got, "$(KILN) exec --task-id slow-task --timeout 10m") {
+		t.Errorf("expected recipe with --timeout flag, got:\n%s", got)
+	}
+	if strings.Contains(got, "--tasks") {
+		t.Error("recipe should not contain --tasks (exec defaults to .kiln/tasks.yaml)")
 	}
 	if strings.Contains(got, "&& touch $@") {
 		t.Error("recipe should not contain '&& touch $@'")
@@ -1204,9 +1226,12 @@ func TestRunGenMake_TaskWithoutTimeout(t *testing.T) {
 		t.Errorf("recipe should not contain --timeout when task has no timeout, got:\n%s", got)
 	}
 
-	// Should still have the basic recipe with --tasks
-	if !strings.Contains(got, "$(KILN) exec --task-id fast-task --tasks "+tasksPath) {
-		t.Errorf("expected basic recipe with --tasks, got:\n%s", got)
+	// Should still have the basic recipe
+	if !strings.Contains(got, "$(KILN) exec --task-id fast-task") {
+		t.Errorf("expected basic recipe, got:\n%s", got)
+	}
+	if strings.Contains(got, "--tasks") {
+		t.Error("recipe should not contain --tasks (exec defaults to .kiln/tasks.yaml)")
 	}
 	if strings.Contains(got, "&& touch $@") {
 		t.Error("recipe should not contain '&& touch $@'")
@@ -1297,6 +1322,36 @@ func TestParseFooter_FooterNotTopLevel(t *testing.T) {
 	_, _, ok := parseFooter(output)
 	if ok {
 		t.Fatal("expected footer to be absent for non-envelope JSON")
+	}
+}
+
+func TestParseFooter_EmbeddedInStreamJSON(t *testing.T) {
+	// Simulates stream-json output where the footer is inside a text content field.
+	output := `{"type":"assistant","message":{"content":[{"type":"text","text":"All done.\n\n{\"kiln\":{\"status\":\"complete\",\"task_id\":\"my-task\",\"notes\":\"done\"}}"}]}}` + "\n"
+	status, taskID, ok := parseFooter(output)
+	if !ok {
+		t.Fatal("expected footer to be found in stream-json output")
+	}
+	if status != "complete" {
+		t.Errorf("expected status complete, got %s", status)
+	}
+	if taskID != "my-task" {
+		t.Errorf("expected task_id my-task, got %s", taskID)
+	}
+}
+
+func TestParseFooter_EmbeddedInResultField(t *testing.T) {
+	// Simulates the "result" type line from stream-json where footer is in the result string.
+	output := `{"type":"result","result":"Summary text.\n\n{\"kiln\":{\"status\":\"not_complete\",\"task_id\":\"t2\"}}"}` + "\n"
+	status, taskID, ok := parseFooter(output)
+	if !ok {
+		t.Fatal("expected footer to be found in result field")
+	}
+	if status != "not_complete" {
+		t.Errorf("expected not_complete, got %s", status)
+	}
+	if taskID != "t2" {
+		t.Errorf("expected task_id t2, got %s", taskID)
 	}
 }
 
@@ -1951,9 +2006,9 @@ func TestRunExec_NoTasksNoPromptFile_Error(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when neither --tasks nor --prompt-file provided")
 	}
-	errMsg := err.Error()
-	if !strings.Contains(errMsg, "--prompt-file") || !strings.Contains(errMsg, "--tasks") {
-		t.Fatalf("expected error mentioning both --prompt-file and --tasks, got: %v", err)
+	// Default --tasks=.kiln/tasks.yaml is loaded; error should mention tasks file
+	if !strings.Contains(err.Error(), "tasks") {
+		t.Fatalf("expected error about tasks file, got: %v", err)
 	}
 }
 
@@ -2655,5 +2710,329 @@ func TestExecLog_LogFileIsValidJSON(t *testing.T) {
 		if _, ok := v[key]; !ok {
 			t.Errorf("log missing required key %q", key)
 		}
+	}
+}
+
+// --- Tests for computeBackoff and --backoff flag ---
+
+func TestComputeBackoff_Fixed_ReturnsSameDuration(t *testing.T) {
+	base := 100 * time.Millisecond
+	for attempt := 1; attempt <= 5; attempt++ {
+		d := computeBackoff("fixed", base, attempt)
+		if d != base {
+			t.Errorf("attempt %d: expected %v, got %v", attempt, base, d)
+		}
+	}
+}
+
+func TestComputeBackoff_Exponential_IncreasesWithAttempts(t *testing.T) {
+	base := 100 * time.Millisecond
+	// For attempt N, delay (without jitter) = base * 2^(N-1).
+	// With jitter 0–50%, range is [base*2^(N-1), base*2^(N-1)*1.5].
+	cases := []struct {
+		attempt     int
+		expectedMin time.Duration
+		expectedMax time.Duration
+	}{
+		{1, 100 * time.Millisecond, 150 * time.Millisecond},
+		{2, 200 * time.Millisecond, 300 * time.Millisecond},
+		{3, 400 * time.Millisecond, 600 * time.Millisecond},
+		{4, 800 * time.Millisecond, 1200 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		for run := 0; run < 5; run++ {
+			d := computeBackoff("exponential", base, tc.attempt)
+			if d < tc.expectedMin || d > tc.expectedMax {
+				t.Errorf("attempt %d run %d: expected [%v, %v], got %v",
+					tc.attempt, run, tc.expectedMin, tc.expectedMax, d)
+			}
+		}
+	}
+}
+
+func TestComputeBackoff_Exponential_CappedAtMaxBackoff(t *testing.T) {
+	base := time.Minute
+	// base * 2^9 = 512 minutes >> maxBackoffDuration (5m), so delay should be capped.
+	for run := 0; run < 5; run++ {
+		d := computeBackoff("exponential", base, 10)
+		maxAllowed := maxBackoffDuration + maxBackoffDuration/2
+		if d < maxBackoffDuration {
+			t.Errorf("run %d: expected >= maxBackoffDuration %v, got %v", run, maxBackoffDuration, d)
+		}
+		if d > maxAllowed {
+			t.Errorf("run %d: expected <= %v (cap + 50%% jitter), got %v", run, maxAllowed, d)
+		}
+	}
+}
+
+func TestComputeBackoff_Exponential_HasJitter(t *testing.T) {
+	base := time.Second
+	// Over 20 calls, jitter should produce varying values (probability of all equal ≈ 0).
+	seen := make(map[time.Duration]bool)
+	for i := 0; i < 20; i++ {
+		d := computeBackoff("exponential", base, 1)
+		seen[d] = true
+	}
+	if len(seen) == 1 {
+		t.Error("expected jitter to produce varying delays, but all 20 calls returned same value")
+	}
+}
+
+func TestRunExec_InvalidBackoffFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	_, err := runExec([]string{
+		"--task-id", "t1",
+		"--prompt-file", promptPath,
+		"--backoff", "invalid-strategy",
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected error for invalid --backoff value")
+	}
+	if !strings.Contains(err.Error(), "invalid --backoff") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunExec_ExponentialBackoff_DelaysIncrease(t *testing.T) {
+	origBuilder := commandBuilder
+	origSleep := sleepFn
+	t.Cleanup(func() {
+		commandBuilder = origBuilder
+		sleepFn = origSleep
+	})
+
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=fail")
+		return cmd
+	}
+
+	var slept []time.Duration
+	sleepFn = func(d time.Duration) { slept = append(slept, d) }
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{
+		"--task-id", "exp-backoff",
+		"--prompt-file", promptPath,
+		"--retries", "2",
+		"--retry-backoff", "100ms",
+		"--backoff", "exponential",
+	}, &bytes.Buffer{})
+
+	if len(slept) != 2 {
+		t.Fatalf("expected 2 sleeps, got %d", len(slept))
+	}
+	// sleep[0] after attempt 1: base * 2^0 = 100ms + jitter → [100ms, 150ms]
+	// sleep[1] after attempt 2: base * 2^1 = 200ms + jitter → [200ms, 300ms]
+	if slept[0] < 100*time.Millisecond || slept[0] > 150*time.Millisecond {
+		t.Errorf("sleep[0]: expected [100ms, 150ms], got %v", slept[0])
+	}
+	if slept[1] < 200*time.Millisecond || slept[1] > 300*time.Millisecond {
+		t.Errorf("sleep[1]: expected [200ms, 300ms], got %v", slept[1])
+	}
+	// Ranges don't overlap so second sleep is always greater.
+	if slept[1] <= slept[0] {
+		t.Errorf("expected increasing delays: sleep[0]=%v sleep[1]=%v", slept[0], slept[1])
+	}
+}
+
+// --- Tests for kiln plan ---
+
+// planCommandBuilder returns a commandBuilder that runs the helper process with
+// the given mode and sets KILN_TEST_PLAN_OUT so the helper knows where to write.
+func planCommandBuilder(mode, outPath string) func(context.Context, string, string) *exec.Cmd {
+	return func(ctx context.Context, prompt, model string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(),
+			"KILN_TEST_HELPER_MODE="+mode,
+			"KILN_TEST_PLAN_OUT="+outPath,
+		)
+		return cmd
+	}
+}
+
+func TestRunPlan_MissingPRD(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete") // should not be reached
+
+	tmp := t.TempDir()
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("extract tasks"), 0o644)
+
+	var out bytes.Buffer
+	err := runPlan([]string{
+		"--prd", filepath.Join(tmp, "nonexistent.md"),
+		"--prompt", promptPath,
+		"--out", filepath.Join(tmp, "tasks.yaml"),
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for missing PRD file")
+	}
+	if !strings.Contains(err.Error(), "failed to read PRD file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunPlan_MissingPrompt(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete") // should not be reached
+
+	tmp := t.TempDir()
+	prdPath := filepath.Join(tmp, "PRD.md")
+	os.WriteFile(prdPath, []byte("# PRD"), 0o644)
+
+	var out bytes.Buffer
+	err := runPlan([]string{
+		"--prd", prdPath,
+		"--prompt", filepath.Join(tmp, "nonexistent.md"),
+		"--out", filepath.Join(tmp, "tasks.yaml"),
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for missing prompt file")
+	}
+	if !strings.Contains(err.Error(), "failed to read prompt file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunPlan_ClaudeFails(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	tmp := t.TempDir()
+	prdPath := filepath.Join(tmp, "PRD.md")
+	os.WriteFile(prdPath, []byte("# PRD"), 0o644)
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("extract tasks"), 0o644)
+
+	var out bytes.Buffer
+	err := runPlan([]string{
+		"--prd", prdPath,
+		"--prompt", promptPath,
+		"--out", filepath.Join(tmp, "tasks.yaml"),
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error when claude fails")
+	}
+	if !strings.Contains(err.Error(), "claude invocation failed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunPlan_InvalidOutputYAML(t *testing.T) {
+	tmp := t.TempDir()
+	outPath := filepath.Join(tmp, "tasks.yaml")
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = planCommandBuilder("write-invalid-yaml", outPath)
+
+	prdPath := filepath.Join(tmp, "PRD.md")
+	os.WriteFile(prdPath, []byte("# PRD"), 0o644)
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("extract tasks"), 0o644)
+
+	var out bytes.Buffer
+	err := runPlan([]string{
+		"--prd", prdPath,
+		"--prompt", promptPath,
+		"--out", outPath,
+	}, &out)
+	if err == nil {
+		t.Fatal("expected error for invalid output YAML")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunPlan_Success(t *testing.T) {
+	tmp := t.TempDir()
+	outPath := filepath.Join(tmp, "tasks.yaml")
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = planCommandBuilder("write-tasks", outPath)
+
+	prdPath := filepath.Join(tmp, "PRD.md")
+	os.WriteFile(prdPath, []byte("# PRD"), 0o644)
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("extract tasks"), 0o644)
+
+	var out bytes.Buffer
+	err := runPlan([]string{
+		"--prd", prdPath,
+		"--prompt", promptPath,
+		"--out", outPath,
+	}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out.String(), "plan: wrote") {
+		t.Fatalf("expected success message, got: %s", out.String())
+	}
+
+	// Verify tasks.yaml exists and is valid.
+	tasks, err := loadTasks(outPath)
+	if err != nil {
+		t.Fatalf("expected valid tasks.yaml, got: %v", err)
+	}
+	if len(tasks) == 0 {
+		t.Fatal("expected at least one task")
+	}
+}
+
+func TestRun_PlanDispatch(t *testing.T) {
+	tmp := t.TempDir()
+	outPath := filepath.Join(tmp, "tasks.yaml")
+
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = planCommandBuilder("write-tasks", outPath)
+
+	prdPath := filepath.Join(tmp, "PRD.md")
+	os.WriteFile(prdPath, []byte("# PRD"), 0o644)
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("extract tasks"), 0o644)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"plan",
+		"--prd", prdPath,
+		"--prompt", promptPath,
+		"--out", outPath,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr: %s", code, stderr.String())
+	}
+}
+
+func TestRunPlan_DefaultFlags(t *testing.T) {
+	// Verify defaults are sensible by checking error messages reference expected paths.
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete") // won't be reached
+
+	var out bytes.Buffer
+	// No flags → should fail on missing PRD.md (the default prd path).
+	err := runPlan([]string{}, &out)
+	if err == nil {
+		t.Fatal("expected error with default flags when PRD.md absent")
+	}
+	if !strings.Contains(err.Error(), "PRD.md") {
+		t.Fatalf("expected error to mention PRD.md, got: %v", err)
 	}
 }

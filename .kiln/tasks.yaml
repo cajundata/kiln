@@ -51,6 +51,10 @@
   needs:
     - exec-retry
 
+- id: prompt-extract-tasks
+  prompt: .kiln/prompts/tasks/prompt-extract-tasks.md
+  needs: []
+
 - id: plan-command
   prompt: .kiln/prompts/tasks/plan-command.md
   needs:
@@ -59,8 +63,4 @@
 
 - id: makefile-setup
   prompt: .kiln/prompts/tasks/makefile-setup.md
-  needs: []
-
-- id: prompt-extract-tasks
-  prompt: .kiln/prompts/tasks/prompt-extract-tasks.md
   needs: []

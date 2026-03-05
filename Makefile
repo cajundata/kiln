@@ -4,14 +4,15 @@ PROMPT_DIR := .kiln/prompts
 TASKS_FILE := .kiln/tasks.yaml
 TARGETS_FILE := .kiln/targets.mk
 
+# ---- Generated targets (conditionally included) ----
+-include $(TARGETS_FILE)
+
 # ---- Phony Targets ----
-.PHONY: plan graph all
+.PHONY: plan graph clean
 
 # Generate tasks.yaml from PRD.md
 plan:
-	$(KILN) exec \
-		--task-id extract-tasks \
-		--prompt-file $(PROMPT_DIR)/00_extract_tasks.md
+	$(KILN) plan
 
 # Generate Make targets from tasks.yaml
 graph:
@@ -19,9 +20,14 @@ graph:
 		--tasks $(TASKS_FILE) \
 		--out $(TARGETS_FILE)
 
-# Run all tasks in graph
-all: graph
-	$(MAKE) -f $(TARGETS_FILE) all
+# Fallback: fail with a clear message if targets.mk has not been generated yet
+ifeq ($(wildcard $(TARGETS_FILE)),)
+.PHONY: all
+all:
+	$(error $(TARGETS_FILE) not found — run 'make graph' first)
+endif
 
-# Include generated targets if present
--include $(TARGETS_FILE)
+# Remove all generated artifacts
+.PHONY: clean
+clean:
+	rm -rf .kiln/done .kiln/logs $(TARGETS_FILE)
