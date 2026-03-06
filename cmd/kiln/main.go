@@ -311,6 +311,7 @@ type Task struct {
 	Validation  []string          `yaml:"validation,omitempty"`
 	Engine      string            `yaml:"engine,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"`
+	DevPhase    int               `yaml:"dev-phase,omitempty"`
 }
 
 // taskIDRegexp is the valid pattern for task IDs (kebab-case).
@@ -557,6 +558,7 @@ func runGenMake(args []string) error {
 	fs := flag.NewFlagSet("gen-make", flag.ContinueOnError)
 	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
 	outFile := fs.String("out", "", "output path for targets.mk")
+	devPhase := fs.Int("dev-phase", 0, "filter tasks to a specific dev-phase (0 = all)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -572,6 +574,19 @@ func runGenMake(args []string) error {
 	tasks, err := loadTasks(*tasksFile)
 	if err != nil {
 		return err
+	}
+
+	if *devPhase > 0 {
+		filtered := make([]Task, 0, len(tasks))
+		for _, t := range tasks {
+			if t.DevPhase == *devPhase {
+				filtered = append(filtered, t)
+			}
+		}
+		if len(filtered) == 0 {
+			return fmt.Errorf("no tasks found for dev-phase %d", *devPhase)
+		}
+		tasks = filtered
 	}
 
 	var buf bytes.Buffer

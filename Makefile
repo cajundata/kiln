@@ -24,7 +24,8 @@ plan: $(KILN)
 graph: $(KILN)
 	$(KILN) gen-make \
 		--tasks $(TASKS_FILE) \
-		--out $(TARGETS_FILE)
+		--out $(TARGETS_FILE) \
+		$(if $(DEV_PHASE),--dev-phase $(DEV_PHASE))
 
 # Fallback: fail with a clear message if targets.mk has not been generated yet
 ifeq ($(wildcard $(TARGETS_FILE)),)
