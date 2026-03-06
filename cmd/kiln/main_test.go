@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -4036,5 +4038,784 @@ func TestRunStatus_EmptyStateMissingJSON(t *testing.T) {
 	}
 	if !strings.Contains(out, "runnable") {
 		t.Errorf("expected runnable status, got:\n%s", out)
+	}
+}
+
+// --- Tests for richer schema fields ---
+
+func TestLoadTasks_RicherSchema_AllNewFields(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: rich-new-task
+  prompt: rich.md
+  needs: []
+  phase: build
+  milestone: m1-core
+  acceptance:
+    - Given a user exists, when they login, then they get a token
+    - Dashboard loads within 2s
+  verify:
+    - go test ./...
+    - go vet ./...
+  lane: backend-lane
+  exclusive: true
+`), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	task := tasks[0]
+	if task.Phase != "build" {
+		t.Errorf("expected phase 'build', got %q", task.Phase)
+	}
+	if task.Milestone != "m1-core" {
+		t.Errorf("expected milestone 'm1-core', got %q", task.Milestone)
+	}
+	if len(task.Acceptance) != 2 {
+		t.Errorf("expected 2 acceptance criteria, got %d", len(task.Acceptance))
+	}
+	if len(task.Verify) != 2 || task.Verify[0] != "go test ./..." {
+		t.Errorf("unexpected verify: %v", task.Verify)
+	}
+	if task.Lane != "backend-lane" {
+		t.Errorf("expected lane 'backend-lane', got %q", task.Lane)
+	}
+	if !task.Exclusive {
+		t.Error("expected exclusive to be true")
+	}
+}
+
+func TestLoadTasks_BackwardCompat_NoNewFields(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: old-task
+  prompt: old.md
+  needs: []
+  description: legacy task
+  kind: feature
+  retries: 2
+`), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(tasks))
+	}
+	task := tasks[0]
+	if task.Phase != "" || task.Milestone != "" || task.Lane != "" || task.Exclusive {
+		t.Error("new fields should be zero-valued when absent")
+	}
+	if len(task.Acceptance) != 0 || len(task.Verify) != 0 {
+		t.Error("new slice fields should be empty when absent")
+	}
+}
+
+func TestLoadTasks_WhitespaceOnlyPhaseRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: bad-task\n  prompt: p.md\n  phase: \"   \"\n"), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for whitespace-only phase")
+	}
+	if !strings.Contains(err.Error(), "phase must not be whitespace-only") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_NonKebabMilestoneRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: bad-task\n  prompt: p.md\n  milestone: \"M1 Auth\"\n"), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for non-kebab milestone")
+	}
+	if !strings.Contains(err.Error(), "milestone must be kebab-case") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_EmptyAcceptanceEntryRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  acceptance:
+    - valid criterion
+    - ""
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for empty acceptance entry")
+	}
+	if !strings.Contains(err.Error(), "acceptance[1] must not be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_EmptyVerifyEntryRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: bad-task
+  prompt: p.md
+  verify:
+    - go test ./...
+    - ""
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for empty verify entry")
+	}
+	if !strings.Contains(err.Error(), "verify[1] must not be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_NonKebabLaneRejected(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: bad-task\n  prompt: p.md\n  lane: \"Bad Lane!\"\n"), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for non-kebab lane")
+	}
+	if !strings.Contains(err.Error(), "lane must be kebab-case") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadTasks_ExclusiveTrueAccepted(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: excl-task\n  prompt: p.md\n  exclusive: true\n"), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !tasks[0].Exclusive {
+		t.Error("expected exclusive to be true")
+	}
+}
+
+func TestRunGenMake_PhaseTargetsGenerated(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte(`- id: task-a
+  prompt: a.md
+  needs: []
+  phase: build
+- id: task-b
+  prompt: b.md
+  needs: []
+  phase: build
+- id: task-c
+  prompt: c.md
+  needs: []
+  phase: verify
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	if !strings.Contains(got, ".PHONY: phase-build") {
+		t.Errorf("expected phase-build phony target, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".PHONY: phase-verify") {
+		t.Errorf("expected phase-verify phony target, got:\n%s", got)
+	}
+	if !strings.Contains(got, "phase-build: .kiln/done/task-a.done .kiln/done/task-b.done") {
+		t.Errorf("expected phase-build to depend on task-a and task-b, got:\n%s", got)
+	}
+	if !strings.Contains(got, "phase-verify: .kiln/done/task-c.done") {
+		t.Errorf("expected phase-verify to depend on task-c, got:\n%s", got)
+	}
+}
+
+func TestRunGenMake_MilestoneTargetsGenerated(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte(`- id: task-x
+  prompt: x.md
+  needs: []
+  milestone: m1-auth
+- id: task-y
+  prompt: y.md
+  needs: []
+  milestone: m2-payments
+- id: task-z
+  prompt: z.md
+  needs: []
+  milestone: m1-auth
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	if !strings.Contains(got, ".PHONY: milestone-m1-auth") {
+		t.Errorf("expected milestone-m1-auth phony target, got:\n%s", got)
+	}
+	if !strings.Contains(got, ".PHONY: milestone-m2-payments") {
+		t.Errorf("expected milestone-m2-payments phony target, got:\n%s", got)
+	}
+	if !strings.Contains(got, "milestone-m1-auth: .kiln/done/task-x.done .kiln/done/task-z.done") {
+		t.Errorf("expected milestone-m1-auth to depend on task-x and task-z, got:\n%s", got)
+	}
+	if !strings.Contains(got, "milestone-m2-payments: .kiln/done/task-y.done") {
+		t.Errorf("expected milestone-m2-payments to depend on task-y, got:\n%s", got)
+	}
+}
+
+func TestRunGenMake_NoPhaseOrMilestoneTargets_WhenFieldsAbsent(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte(`- id: plain-task
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	if strings.Contains(got, "phase-") {
+		t.Errorf("expected no phase targets when no tasks have phase set, got:\n%s", got)
+	}
+	if strings.Contains(got, "milestone-") {
+		t.Errorf("expected no milestone targets when no tasks have milestone set, got:\n%s", got)
+	}
+}
+
+func TestRunGenMake_ModelPassedInRecipe(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte(`- id: modeled-task
+  prompt: m.md
+  needs: []
+  model: claude-haiku-4-5-20251001
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	if !strings.Contains(got, "--model claude-haiku-4-5-20251001") {
+		t.Errorf("expected --model flag in recipe, got:\n%s", got)
+	}
+}
+
+func TestRunGenMake_NoModelInRecipe_WhenModelAbsent(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte(`- id: plain-task
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	if strings.Contains(got, "--model") {
+		t.Errorf("expected no --model flag when task has no model, got:\n%s", got)
+	}
+}
+
+func TestRunGenMake_PhaseAndMilestoneSorted(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	// Phase values in reverse alphabetical order to verify sorting
+	os.WriteFile(tasksPath, []byte(`- id: task-verify
+  prompt: v.md
+  needs: []
+  phase: verify
+  milestone: m3-end
+- id: task-build
+  prompt: b.md
+  needs: []
+  phase: build
+  milestone: m1-start
+- id: task-plan
+  prompt: p.md
+  needs: []
+  phase: plan
+  milestone: m2-mid
+`), 0o644)
+
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, _ := os.ReadFile(outPath)
+	got := string(data)
+
+	// Check alphabetical ordering of phase targets
+	buildIdx := strings.Index(got, "phase-build")
+	planIdx := strings.Index(got, "phase-plan")
+	verifyIdx := strings.Index(got, "phase-verify")
+	if buildIdx < 0 || planIdx < 0 || verifyIdx < 0 {
+		t.Fatalf("missing phase targets, got:\n%s", got)
+	}
+	if buildIdx >= planIdx || planIdx >= verifyIdx {
+		t.Errorf("phase targets not sorted alphabetically: build=%d plan=%d verify=%d", buildIdx, planIdx, verifyIdx)
+	}
+
+	// Check alphabetical ordering of milestone targets
+	m1Idx := strings.Index(got, "milestone-m1-start")
+	m2Idx := strings.Index(got, "milestone-m2-mid")
+	m3Idx := strings.Index(got, "milestone-m3-end")
+	if m1Idx < 0 || m2Idx < 0 || m3Idx < 0 {
+		t.Fatalf("missing milestone targets, got:\n%s", got)
+	}
+	if m1Idx >= m2Idx || m2Idx >= m3Idx {
+		t.Errorf("milestone targets not sorted alphabetically: m1=%d m2=%d m3=%d", m1Idx, m2Idx, m3Idx)
+	}
+}
+
+func TestRunStatus_ShowsKindAndPhase(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: my-task
+  prompt: p.md
+  needs: []
+  kind: backend
+  phase: build
+`), 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "KIND") {
+		t.Errorf("expected KIND column header, got:\n%s", out)
+	}
+	if !strings.Contains(out, "PHASE") {
+		t.Errorf("expected PHASE column header, got:\n%s", out)
+	}
+	if !strings.Contains(out, "backend") {
+		t.Errorf("expected kind 'backend' in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "build") {
+		t.Errorf("expected phase 'build' in output, got:\n%s", out)
+	}
+}
+
+// --- Concurrency safety / lock tests ---
+
+func TestAcquireLock_CreatesLockFile(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+
+	cleanup, err := acquireLock(locksDir, "my-task")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer cleanup()
+
+	lockPath := filepath.Join(locksDir, "my-task.lock")
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("lock file not created: %v", err)
+	}
+
+	var info lockInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		t.Fatalf("lock file contains invalid JSON: %v", err)
+	}
+	if info.PID != os.Getpid() {
+		t.Errorf("expected PID %d, got %d", os.Getpid(), info.PID)
+	}
+	if info.StartedAt == "" {
+		t.Error("expected non-empty started_at")
+	}
+	if info.Hostname == "" {
+		t.Error("expected non-empty hostname")
+	}
+}
+
+func TestAcquireLock_ConflictReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+
+	cleanup, err := acquireLock(locksDir, "conflict-task")
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+	defer cleanup()
+
+	_, err2 := acquireLock(locksDir, "conflict-task")
+	if err2 == nil {
+		t.Fatal("expected error for duplicate lock acquisition")
+	}
+}
+
+func TestAcquireLock_ErrorContainsPIDAndHostname(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+
+	cleanup, err := acquireLock(locksDir, "diag-task")
+	if err != nil {
+		t.Fatalf("first lock failed: %v", err)
+	}
+	defer cleanup()
+
+	_, err2 := acquireLock(locksDir, "diag-task")
+	if err2 == nil {
+		t.Fatal("expected error for duplicate lock")
+	}
+
+	msg := err2.Error()
+	pidStr := fmt.Sprintf("%d", os.Getpid())
+	if !strings.Contains(msg, pidStr) {
+		t.Errorf("error message missing PID %s: %s", pidStr, msg)
+	}
+
+	hostname, _ := os.Hostname()
+	if !strings.Contains(msg, hostname) {
+		t.Errorf("error message missing hostname %s: %s", hostname, msg)
+	}
+}
+
+func TestAcquireLock_CleanupRemovesLock(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+	lockPath := filepath.Join(locksDir, "rm-task.lock")
+
+	cleanup, err := acquireLock(locksDir, "rm-task")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatal("lock file should exist before cleanup")
+	}
+
+	cleanup()
+
+	if _, err := os.Stat(lockPath); err == nil {
+		t.Fatal("lock file should be removed after cleanup")
+	}
+}
+
+func TestAcquireLock_CleanupIsIdempotent(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+
+	cleanup, err := acquireLock(locksDir, "idem-task")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Calling cleanup multiple times must not panic or error.
+	cleanup()
+	cleanup()
+	cleanup()
+}
+
+func TestAcquireLock_CreatesDirectory(t *testing.T) {
+	tmp := t.TempDir()
+	// Use a nested directory that doesn't exist yet.
+	locksDir := filepath.Join(tmp, "nested", "deep", "locks")
+
+	cleanup, err := acquireLock(locksDir, "dir-task")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer cleanup()
+
+	if info, err := os.Stat(locksDir); err != nil || !info.IsDir() {
+		t.Fatalf("locks directory not created: %v", err)
+	}
+}
+
+func TestAcquireLock_LockConflictErrorType(t *testing.T) {
+	tmp := t.TempDir()
+	locksDir := filepath.Join(tmp, "locks")
+
+	cleanup, _ := acquireLock(locksDir, "type-task")
+	defer cleanup()
+
+	_, err := acquireLock(locksDir, "type-task")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var lce *lockConflictError
+	if !errors.As(err, &lce) {
+		t.Fatalf("expected lockConflictError, got %T: %v", err, err)
+	}
+	if lce.TaskID != "type-task" {
+		t.Errorf("expected TaskID type-task, got %s", lce.TaskID)
+	}
+}
+
+func TestRunExec_LockConflictExitCode10(t *testing.T) {
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+
+	// Pre-create a stale lock file for the task.
+	locksDir := filepath.Join(tmp, ".kiln", "locks")
+	if err := os.MkdirAll(locksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleInfo := lockInfo{PID: 99999, StartedAt: time.Now().UTC().Format(time.RFC3339), Hostname: "other-host"}
+	data, _ := json.Marshal(staleInfo)
+	os.WriteFile(filepath.Join(locksDir, "locked-task.lock"), data, 0o644)
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"exec", "--task-id", "locked-task", "--prompt-file", promptPath}, &stdout, &stderr)
+	if code != 10 {
+		t.Fatalf("expected exit code 10 for lock conflict, got %d; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "locked-task") {
+		t.Errorf("error message should mention task ID, got: %s", stderr.String())
+	}
+}
+
+func TestRunExec_ForceUnlockRemovesStale(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+
+	t.Setenv("KILN_TEST_TASK_ID", "force-task")
+
+	// Pre-create a stale lock file.
+	locksDir := filepath.Join(tmp, ".kiln", "locks")
+	os.MkdirAll(locksDir, 0o755)
+	staleInfo := lockInfo{PID: 99999, StartedAt: time.Now().UTC().Format(time.RFC3339), Hostname: "old-host"}
+	staleData, _ := json.Marshal(staleInfo)
+	os.WriteFile(filepath.Join(locksDir, "force-task.lock"), staleData, 0o644)
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "force-task",
+		"--prompt-file", promptPath,
+		"--force-unlock",
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = code
+	if !strings.Contains(stdout.String(), "force-unlock") {
+		t.Errorf("expected force-unlock warning in output, got: %s", stdout.String())
+	}
+}
+
+func TestRunExec_LockReleasedAfterSuccess(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+
+	t.Setenv("KILN_TEST_TASK_ID", "release-ok")
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	_, err := runExec([]string{
+		"--task-id", "release-ok",
+		"--prompt-file", promptPath,
+	}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Lock should be released — re-acquiring should succeed.
+	locksDir := filepath.Join(tmp, ".kiln", "locks")
+	cleanup, err2 := acquireLock(locksDir, "release-ok")
+	if err2 != nil {
+		t.Fatalf("lock not released after successful exec: %v", err2)
+	}
+	cleanup()
+}
+
+func TestRunExec_LockReleasedAfterFailure(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	_, _ = runExec([]string{
+		"--task-id", "release-fail",
+		"--prompt-file", promptPath,
+	}, &bytes.Buffer{})
+
+	// Lock should be released — re-acquiring should succeed.
+	locksDir := filepath.Join(tmp, ".kiln", "locks")
+	cleanup, err := acquireLock(locksDir, "release-fail")
+	if err != nil {
+		t.Fatalf("lock not released after failed exec: %v", err)
+	}
+	cleanup()
+}
+
+func TestRunExec_LockReleasedAfterTimeout(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("hang")
+
+	tmp := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+
+	promptPath := filepath.Join(tmp, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	_, _ = runExec([]string{
+		"--task-id", "release-timeout",
+		"--prompt-file", promptPath,
+		"--timeout", "200ms",
+	}, &bytes.Buffer{})
+
+	// Lock should be released — re-acquiring should succeed.
+	locksDir := filepath.Join(tmp, ".kiln", "locks")
+	cleanup, err := acquireLock(locksDir, "release-timeout")
+	if err != nil {
+		t.Fatalf("lock not released after timeout: %v", err)
+	}
+	cleanup()
+}
+
+func TestRunGenMake_CreatesLocksDir(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
+
+	if err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	locksDir := filepath.Join(tmp, "locks")
+	info, err := os.Stat(locksDir)
+	if err != nil {
+		t.Fatalf("locks directory not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected locks to be a directory")
+	}
+}
+
+func TestAtomicLogWrite_ConcurrentWritesSafe(t *testing.T) {
+	tmp := t.TempDir()
+	logDir := filepath.Join(tmp, "logs")
+
+	const goroutines = 5
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			entry := execRunLog{
+				TaskID:     fmt.Sprintf("task-%d", i),
+				StartedAt:  time.Now(),
+				EndedAt:    time.Now(),
+				DurationMs: int64(i * 100),
+				Status:     "complete",
+				ExitCode:   0,
+			}
+			if err := writeExecLog(logDir, entry.TaskID, entry); err != nil {
+				t.Errorf("writeExecLog failed for task-%d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify each log file is valid JSON.
+	for i := 0; i < goroutines; i++ {
+		logPath := filepath.Join(logDir, fmt.Sprintf("task-%d.json", i))
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Errorf("log file task-%d.json not found: %v", i, err)
+			continue
+		}
+		var entry execRunLog
+		if err := json.Unmarshal(data, &entry); err != nil {
+			t.Errorf("task-%d.json contains invalid JSON: %v\ncontent: %s", i, err, data)
+		}
+		if entry.TaskID != fmt.Sprintf("task-%d", i) {
+			t.Errorf("task-%d.json has wrong task_id: %s", i, entry.TaskID)
+		}
 	}
 }

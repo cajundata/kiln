@@ -1,69 +1,84 @@
 - id: state-resumability
   prompt: .kiln/prompts/tasks/state-resumability.md
+  dev-phase: 1
   needs: []
 
 - id: richer-schema
   prompt: .kiln/prompts/tasks/richer-schema.md
+  dev-phase: 1
   needs: []
 
 - id: concurrency-safety
   prompt: .kiln/prompts/tasks/concurrency-safety.md
+  dev-phase: 1
   needs: []
 
 - id: json-output
   prompt: .kiln/prompts/tasks/json-output.md
+  dev-phase: 4
   needs: []
 
 - id: kiln-init
   prompt: .kiln/prompts/tasks/kiln-init.md
+  dev-phase: 4
   needs: []
 
 - id: profile-strategy
   prompt: .kiln/prompts/tasks/profile-strategy.md
+  dev-phase: 4
   needs: []
 
 - id: unify-closure
   prompt: .kiln/prompts/tasks/unify-closure.md
+  dev-phase: 2
   needs:
     - state-resumability
 
 - id: error-taxonomy
   prompt: .kiln/prompts/tasks/error-taxonomy.md
+  dev-phase: 2
   needs:
     - state-resumability
 
 - id: recovery-ux
   prompt: .kiln/prompts/tasks/recovery-ux.md
+  dev-phase: 2
   needs:
     - state-resumability
 
 - id: validation-hooks
   prompt: .kiln/prompts/tasks/validation-hooks.md
+  dev-phase: 3
   needs:
     - richer-schema
 
 - id: interactive-tui
   prompt: .kiln/prompts/tasks/interactive-tui.md
+  dev-phase: 4
   needs:
     - state-resumability
 
 - id: git-automation
   prompt: .kiln/prompts/tasks/git-automation.md
+  dev-phase: 5
   needs: []
 
 - id: verify-plan
   prompt: .kiln/prompts/tasks/verify-plan.md
+  dev-phase: 3
   needs:
     - richer-schema
     - validation-hooks
 
 - id: prompt-chaining
   prompt: .kiln/prompts/tasks/prompt-chaining.md
+  dev-phase: 3
   needs:
     - unify-closure
     - richer-schema
 
 - id: engine-abstraction
   prompt: .kiln/prompts/tasks/engine-abstraction.md
+  dev-phase: 5
   needs:
     - richer-schema

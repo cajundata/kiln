@@ -21,6 +21,9 @@ profile.cov
 # Logs
 .kiln/logs/
 
+# Lock files (ephemeral, process-scoped)
+.kiln/locks/
+
 # Go workspace file
 go.work
 go.work.sum

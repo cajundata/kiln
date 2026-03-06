@@ -12,10 +12,12 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -53,6 +55,67 @@ func isRetryable(err error) bool {
 	}
 	var ce *claudeExitError
 	return errors.As(err, &ce)
+}
+
+// lockInfo holds diagnostics written to a task's lock file.
+type lockInfo struct {
+	PID       int    `json:"pid"`
+	StartedAt string `json:"started_at"`
+	Hostname  string `json:"hostname"`
+}
+
+// lockConflictError is returned when a task lock is already held by another process.
+type lockConflictError struct {
+	TaskID   string
+	LockPath string
+	Holder   lockInfo
+}
+
+func (e *lockConflictError) Error() string {
+	return fmt.Sprintf(
+		"task %s is already locked by PID %d (started %s on %s). Use --force-unlock if the process is no longer running.",
+		e.TaskID, e.Holder.PID, e.Holder.StartedAt, e.Holder.Hostname,
+	)
+}
+
+// acquireLock atomically creates a lock file for the given task ID under locksDir.
+// On success, returns an idempotent cleanup function that removes the lock file.
+// If the lock file already exists, returns a lockConflictError with the holder's diagnostics.
+func acquireLock(locksDir string, taskID string) (func(), error) {
+	if err := os.MkdirAll(locksDir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create locks directory: %w", err)
+	}
+	lockPath := filepath.Join(locksDir, taskID+".lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			data, readErr := os.ReadFile(lockPath)
+			if readErr != nil {
+				return nil, fmt.Errorf("task %s is already locked (could not read lock file: %v). Use --force-unlock if the process is no longer running.", taskID, readErr)
+			}
+			var info lockInfo
+			if jsonErr := json.Unmarshal(data, &info); jsonErr != nil {
+				return nil, fmt.Errorf("task %s is already locked (could not parse lock file). Use --force-unlock if the process is no longer running.", taskID)
+			}
+			return nil, &lockConflictError{TaskID: taskID, LockPath: lockPath, Holder: info}
+		}
+		return nil, fmt.Errorf("failed to create lock file: %w", err)
+	}
+	hostname, _ := os.Hostname()
+	info := lockInfo{
+		PID:       os.Getpid(),
+		StartedAt: time.Now().UTC().Format(time.RFC3339),
+		Hostname:  hostname,
+	}
+	data, _ := json.Marshal(info)
+	_, _ = f.Write(data)
+	_ = f.Close()
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() { _ = os.Remove(lockPath) })
+	}
+	return cleanup, nil
 }
 
 // kilnFooterPayload holds the inner fields of the kiln JSON footer.
@@ -252,6 +315,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			if errors.As(err, &fe) {
 				return 10
 			}
+			var lce *lockConflictError
+			if errors.As(err, &lce) {
+				return 10
+			}
 			return 1
 		}
 		return code
@@ -305,13 +372,34 @@ type Task struct {
 	Timeout     string            `yaml:"timeout,omitempty"`
 	Model       string            `yaml:"model,omitempty"`
 	Description string            `yaml:"description,omitempty"`
-	Kind        string            `yaml:"kind,omitempty"`
-	Tags        []string          `yaml:"tags,omitempty"`
-	Retries     int               `yaml:"retries,omitempty"`
-	Validation  []string          `yaml:"validation,omitempty"`
-	Engine      string            `yaml:"engine,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty"`
-	DevPhase    int               `yaml:"dev-phase,omitempty"`
+	// Kind classifies the task type (e.g. "feature", "fix", "research", "docs").
+	// Convention: tasks with kind "research" are expected to produce artifacts at
+	// .kiln/artifacts/research/<id>.md — this is a naming convention only and is
+	// not enforced by kiln.
+	Kind       string            `yaml:"kind,omitempty"`
+	Tags       []string          `yaml:"tags,omitempty"`
+	Retries    int               `yaml:"retries,omitempty"`
+	Validation []string          `yaml:"validation,omitempty"`
+	Engine     string            `yaml:"engine,omitempty"`
+	Env        map[string]string `yaml:"env,omitempty"`
+	DevPhase   int               `yaml:"dev-phase,omitempty"`
+	// Phase is a human-oriented lifecycle phase (e.g. "plan", "build", "verify", "docs").
+	// Free-form but must be non-whitespace-only if present.
+	Phase string `yaml:"phase,omitempty"`
+	// Milestone is a project milestone grouping (e.g. "m1-auth", "m2-payments").
+	// Must be kebab-case if present.
+	Milestone string `yaml:"milestone,omitempty"`
+	// Acceptance lists acceptance criteria (Given/When/Then or bullet AC).
+	// Each entry must be non-empty.
+	Acceptance []string `yaml:"acceptance,omitempty"`
+	// Verify lists gate commands to run post-completion (e.g. "go test ./...", "go vet ./...").
+	// Each entry must be non-empty.
+	Verify []string `yaml:"verify,omitempty"`
+	// Lane is a concurrency grouping identifier. Tasks in the same lane run serially.
+	// Must be kebab-case if present.
+	Lane string `yaml:"lane,omitempty"`
+	// Exclusive, if true, means this task must run with no other tasks in parallel.
+	Exclusive bool `yaml:"exclusive,omitempty"`
 }
 
 // taskIDRegexp is the valid pattern for task IDs (kebab-case).
@@ -381,6 +469,25 @@ func loadTasks(path string) ([]Task, error) {
 			if !envVarKeyRegexp.MatchString(k) {
 				return nil, fmt.Errorf("task %q: env key %q is not a valid environment variable name", t.ID, k)
 			}
+		}
+		if t.Phase != "" && strings.TrimSpace(t.Phase) == "" {
+			return nil, fmt.Errorf("task %q: phase must not be whitespace-only", t.ID)
+		}
+		if t.Milestone != "" && !taskIDRegexp.MatchString(t.Milestone) {
+			return nil, fmt.Errorf("task %q: milestone must be kebab-case, got %q", t.ID, t.Milestone)
+		}
+		for j, ac := range t.Acceptance {
+			if ac == "" {
+				return nil, fmt.Errorf("task %q: acceptance[%d] must not be empty", t.ID, j)
+			}
+		}
+		for j, v := range t.Verify {
+			if v == "" {
+				return nil, fmt.Errorf("task %q: verify[%d] must not be empty", t.ID, j)
+			}
+		}
+		if t.Lane != "" && !taskIDRegexp.MatchString(t.Lane) {
+			return nil, fmt.Errorf("task %q: lane must be kebab-case, got %q", t.ID, t.Lane)
 		}
 	}
 
@@ -605,7 +712,9 @@ func runGenMake(args []string) error {
 	}
 	buf.WriteString("\n\n")
 
-	// Individual targets in definition order
+	// Individual targets in definition order.
+	// Note: tasks with kind "research" are expected to produce artifacts at
+	// .kiln/artifacts/research/<id>.md (convention only, not enforced by kiln).
 	for _, t := range tasks {
 		target := ".kiln/done/" + t.ID + ".done"
 		buf.WriteString(target + ":")
@@ -617,12 +726,61 @@ func runGenMake(args []string) error {
 		if t.Timeout != "" {
 			recipe += " --timeout " + t.Timeout
 		}
+		if t.Model != "" {
+			recipe += " --model " + t.Model
+		}
 		buf.WriteString("\t" + recipe + "\n")
 		buf.WriteString("\n")
 	}
 
-	if err := os.MkdirAll(filepath.Dir(*outFile), 0o755); err != nil {
+	// Collect unique phase values in sorted order and generate .PHONY phase targets.
+	phaseMap := make(map[string][]string) // phase -> list of done markers
+	for _, t := range tasks {
+		if t.Phase != "" {
+			phaseMap[t.Phase] = append(phaseMap[t.Phase], ".kiln/done/"+t.ID+".done")
+		}
+	}
+	if len(phaseMap) > 0 {
+		phases := sortedKeys(phaseMap)
+		for _, phase := range phases {
+			buf.WriteString(".PHONY: phase-" + phase + "\n")
+			buf.WriteString("phase-" + phase + ":")
+			for _, d := range phaseMap[phase] {
+				buf.WriteString(" " + d)
+			}
+			buf.WriteString("\n\n")
+		}
+	}
+
+	// Collect unique milestone values in sorted order and generate .PHONY milestone targets.
+	milestoneMap := make(map[string][]string) // milestone -> list of done markers
+	for _, t := range tasks {
+		if t.Milestone != "" {
+			milestoneMap[t.Milestone] = append(milestoneMap[t.Milestone], ".kiln/done/"+t.ID+".done")
+		}
+	}
+	if len(milestoneMap) > 0 {
+		milestones := sortedKeys(milestoneMap)
+		for _, ms := range milestones {
+			buf.WriteString(".PHONY: milestone-" + ms + "\n")
+			buf.WriteString("milestone-" + ms + ":")
+			for _, d := range milestoneMap[ms] {
+				buf.WriteString(" " + d)
+			}
+			buf.WriteString("\n\n")
+		}
+	}
+
+	kilnDir := filepath.Dir(*outFile)
+	if err := os.MkdirAll(kilnDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Create runtime subdirectories alongside the output file.
+	for _, subdir := range []string{"done", "logs", "locks"} {
+		if err := os.MkdirAll(filepath.Join(kilnDir, subdir), 0o755); err != nil {
+			return fmt.Errorf("failed to create %s directory: %w", subdir, err)
+		}
 	}
 
 	if err := os.WriteFile(*outFile, buf.Bytes(), 0o644); err != nil {
@@ -630,6 +788,21 @@ func runGenMake(args []string) error {
 	}
 
 	return nil
+}
+
+// sortedKeys returns the keys of m in sorted order.
+func sortedKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	// Simple insertion sort — maps are small.
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+		}
+	}
+	return keys
 }
 
 // StateManifest is the top-level state file written to .kiln/state.json.
@@ -751,8 +924,8 @@ func runStatus(args []string, stdout io.Writer) error {
 
 	// Classify and print
 	var doneCount, runnableCount int
-	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-40s %s\n", "TASK", "STATUS", "ATTEMPTS", "LAST ERROR", "NEEDS")
-	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-40s %s\n", "----", "------", "--------", "----------", "-----")
+	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-10s %-10s %-40s %s\n", "TASK", "STATUS", "ATTEMPTS", "KIND", "PHASE", "LAST ERROR", "NEEDS")
+	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-10s %-10s %-40s %s\n", "----", "------", "--------", "----", "-----", "----------", "-----")
 
 	for _, t := range tasks {
 		var status string
@@ -780,7 +953,21 @@ func runStatus(args []string, stdout io.Writer) error {
 				}
 			}
 		}
-		fmt.Fprintf(stdout, "%-30s %-10s %-8d %-40s %s\n", t.ID, status, attempts, lastErr, needs)
+		kind := t.Kind
+		if kind == "" {
+			kind = "-"
+		}
+		if len(kind) > 10 {
+			kind = kind[:9] + "…"
+		}
+		phase := t.Phase
+		if phase == "" {
+			phase = "-"
+		}
+		if len(phase) > 10 {
+			phase = phase[:9] + "…"
+		}
+		fmt.Fprintf(stdout, "%-30s %-10s %-8d %-10s %-10s %-40s %s\n", t.ID, status, attempts, kind, phase, lastErr, needs)
 	}
 
 	fmt.Fprintf(stdout, "\n%d/%d tasks done, %d runnable\n", doneCount, len(tasks), runnableCount)
@@ -962,6 +1149,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	retriesFlag := fs.Int("retries", 0, "number of additional attempts on retryable failures")
 	retryBackoffStr := fs.String("retry-backoff", "0s", "sleep duration between retry attempts")
 	backoffFlag := fs.String("backoff", "fixed", "backoff strategy between retries: fixed or exponential")
+	forceUnlock := fs.Bool("force-unlock", false, "remove existing lock file before acquiring (for stale locks)")
 
 	if err := fs.Parse(args); err != nil {
 		return 0, err
@@ -970,6 +1158,36 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	if *taskID == "" {
 		return 0, fmt.Errorf("--task-id is required")
 	}
+
+	// Acquire task-level lock to prevent concurrent execution of the same task.
+	locksDir := ".kiln/locks"
+	if *forceUnlock {
+		lockPath := filepath.Join(locksDir, *taskID+".lock")
+		if _, statErr := os.Stat(lockPath); statErr == nil {
+			fmt.Fprintf(stdout, "warning: force-unlocking stale lock for task %s\n", *taskID)
+			_ = os.Remove(lockPath)
+		}
+	}
+	unlock, lockErr := acquireLock(locksDir, *taskID)
+	if lockErr != nil {
+		return 10, lockErr
+	}
+
+	// Register signal handler so the lock is released on SIGINT/SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig, ok := <-sigCh
+		if ok && sig != nil {
+			unlock()
+			os.Exit(130)
+		}
+	}()
+	defer func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+		unlock()
+	}()
 
 	// Determine whether --tasks was explicitly provided by the user.
 	tasksExplicit := false
