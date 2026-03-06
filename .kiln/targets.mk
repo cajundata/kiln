@@ -1,12 +1,12 @@
 .PHONY: all
-all: .kiln/done/state-resumability.done .kiln/done/richer-schema.done .kiln/done/concurrency-safety.done
+all: .kiln/done/unify-closure.done .kiln/done/error-taxonomy.done .kiln/done/recovery-ux.done
 
-.kiln/done/state-resumability.done:
-	$(KILN) exec --task-id state-resumability
+.kiln/done/unify-closure.done: .kiln/done/state-resumability.done
+	$(KILN) exec --task-id unify-closure
 
-.kiln/done/richer-schema.done:
-	$(KILN) exec --task-id richer-schema
+.kiln/done/error-taxonomy.done: .kiln/done/state-resumability.done
+	$(KILN) exec --task-id error-taxonomy
 
-.kiln/done/concurrency-safety.done:
-	$(KILN) exec --task-id concurrency-safety
+.kiln/done/recovery-ux.done: .kiln/done/state-resumability.done
+	$(KILN) exec --task-id recovery-ux
 

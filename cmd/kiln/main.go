@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,7 +41,12 @@ func (e *claudeExitError) Error() string { return "claude invocation failed: " +
 func (e *claudeExitError) Unwrap() error { return e.err }
 
 // footerError is returned when the claude output is missing a valid kiln JSON footer.
-type footerError struct{ msg string }
+// isValidation is true when the footer was parsed but contained invalid/unexpected values;
+// false when the footer could not be found or parsed at all.
+type footerError struct {
+	msg          string
+	isValidation bool
+}
 
 func (e *footerError) Error() string { return e.msg }
 
@@ -55,6 +61,45 @@ func isRetryable(err error) bool {
 	}
 	var ce *claudeExitError
 	return errors.As(err, &ce)
+}
+
+// Canonical error class constants for structured error reporting.
+const (
+	ErrClassTimeout          = "timeout"
+	ErrClassClaudeExit       = "claude_exit"
+	ErrClassFooterParse      = "footer_parse"
+	ErrClassFooterValidation = "footer_validation"
+	ErrClassLockConflict     = "lock_conflict"
+	ErrClassSchemaValidation = "schema_validation"
+	ErrClassUnknown          = "unknown"
+)
+
+// classify returns the canonical error class and retryability for the given error.
+// timeout and claude_exit are retryable; all others are not.
+func classify(err error) (errorClass string, retryable bool) {
+	if err == nil {
+		return "", false
+	}
+	var te *timeoutError
+	if errors.As(err, &te) {
+		return ErrClassTimeout, true
+	}
+	var ce *claudeExitError
+	if errors.As(err, &ce) {
+		return ErrClassClaudeExit, true
+	}
+	var fe *footerError
+	if errors.As(err, &fe) {
+		if fe.isValidation {
+			return ErrClassFooterValidation, false
+		}
+		return ErrClassFooterParse, false
+	}
+	var lce *lockConflictError
+	if errors.As(err, &lce) {
+		return ErrClassLockConflict, false
+	}
+	return ErrClassUnknown, false
 }
 
 // lockInfo holds diagnostics written to a task's lock file.
@@ -134,17 +179,20 @@ type logEvent struct {
 
 // execRunLog is the structured JSON log written for each kiln exec attempt.
 type execRunLog struct {
-	TaskID      string              `json:"task_id"`
-	StartedAt   time.Time           `json:"started_at"`
-	EndedAt     time.Time           `json:"ended_at"`
-	DurationMs  int64               `json:"duration_ms"`
-	Model       string              `json:"model"`
-	PromptFile  string              `json:"prompt_file"`
-	ExitCode    int                 `json:"exit_code"`
-	Status      string              `json:"status"` // "complete","not_complete","blocked","timeout","error"
-	Footer      *kilnFooterEnvelope `json:"footer,omitempty"`
-	FooterValid bool                `json:"footer_valid"`
-	Events      []logEvent          `json:"events"`
+	TaskID       string              `json:"task_id"`
+	StartedAt    time.Time           `json:"started_at"`
+	EndedAt      time.Time           `json:"ended_at"`
+	DurationMs   int64               `json:"duration_ms"`
+	Model        string              `json:"model"`
+	PromptFile   string              `json:"prompt_file"`
+	ExitCode     int                 `json:"exit_code"`
+	Status       string              `json:"status"` // "complete","not_complete","blocked","timeout","error"
+	Footer       *kilnFooterEnvelope `json:"footer,omitempty"`
+	FooterValid  bool                `json:"footer_valid"`
+	ErrorClass   string              `json:"error_class,omitempty"`   // canonical error class (see ErrClass* constants)
+	ErrorMessage string              `json:"error_message,omitempty"` // human-readable error description
+	Retryable    bool                `json:"retryable,omitempty"`     // whether this error is retryable
+	Events       []logEvent          `json:"events"`
 }
 
 // lineCapture is an io.Writer that forwards writes to an optional passthrough
@@ -355,6 +403,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "gen-prompts":
 		if err := runGenPrompts(args[1:], stdout); err != nil {
 			fmt.Fprintf(stderr, "gen-prompts: %v\n", err)
+			return 1
+		}
+		return 0
+	case "report":
+		if err := runReport(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "report: %v\n", err)
+			return 1
+		}
+		return 0
+	case "unify":
+		code, err := runUnify(args[1:], stdout)
+		if err != nil {
+			fmt.Fprintf(stderr, "unify: %v\n", err)
+		}
+		return code
+	case "retry":
+		if err := runRetry(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "retry: %v\n", err)
+			return 1
+		}
+		return 0
+	case "reset":
+		if err := runReset(args[1:], os.Stdin, stdout); err != nil {
+			fmt.Fprintf(stderr, "reset: %v\n", err)
+			return 1
+		}
+		return 0
+	case "resume":
+		if err := runResume(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "resume: %v\n", err)
 			return 1
 		}
 		return 0
@@ -777,7 +855,7 @@ func runGenMake(args []string) error {
 	}
 
 	// Create runtime subdirectories alongside the output file.
-	for _, subdir := range []string{"done", "logs", "locks"} {
+	for _, subdir := range []string{"done", "logs", "locks", "unify"} {
 		if err := os.MkdirAll(filepath.Join(kilnDir, subdir), 0o755); err != nil {
 			return fmt.Errorf("failed to create %s directory: %w", subdir, err)
 		}
@@ -862,23 +940,6 @@ func saveState(path string, state *StateManifest) error {
 	return os.Rename(tmpPath, path)
 }
 
-// classifyError returns an error classification string for state tracking.
-func classifyError(err error) string {
-	var te *timeoutError
-	if errors.As(err, &te) {
-		return "timeout"
-	}
-	var ce *claudeExitError
-	if errors.As(err, &ce) {
-		return "claude_exit"
-	}
-	var fe *footerError
-	if errors.As(err, &fe) {
-		return "footer_invalid"
-	}
-	return "permanent"
-}
-
 // hasUnfinishedDeps returns true if any of the given dependency IDs are not in the doneSet.
 func hasUnfinishedDeps(needs []string, doneSet map[string]bool) bool {
 	for _, dep := range needs {
@@ -889,9 +950,80 @@ func hasUnfinishedDeps(needs []string, doneSet map[string]bool) bool {
 	return false
 }
 
+// taskStatusInfo holds the derived display state for a single task.
+type taskStatusInfo struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Attempts int    `json:"attempts"`
+	LastErr  string `json:"last_error,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+	Phase    string `json:"phase,omitempty"`
+}
+
+// deriveTaskStatus returns the effective display status for a task by consulting
+// state.json, done markers, log files, and dep graph in that priority order.
+func deriveTaskStatus(t Task, state *StateManifest, logDir, doneDir string, doneSet map[string]bool) taskStatusInfo {
+	info := taskStatusInfo{ID: t.ID, Kind: t.Kind, Phase: t.Phase}
+
+	// Priority 1: state.json per-task entry.
+	if ts := state.Tasks[t.ID]; ts != nil && ts.Status != "" {
+		status := ts.Status
+		if status == "completed" {
+			status = "complete"
+		}
+		info.Status = status
+		info.Attempts = ts.Attempts
+		if ts.LastErrorClass != "" {
+			info.LastErr = ts.LastErrorClass
+		}
+		if ts.LastError != "" {
+			info.LastErr = ts.LastError
+		}
+		return info
+	}
+
+	// Priority 2: done marker.
+	if doneSet[t.ID] {
+		info.Status = "complete"
+		info.Attempts = 1
+		return info
+	}
+
+	// Priority 3: log file.
+	logPath := filepath.Join(logDir, t.ID+".json")
+	if data, readErr := os.ReadFile(logPath); readErr == nil {
+		var entry execRunLog
+		if json.Unmarshal(data, &entry) == nil {
+			status := entry.Status
+			if status == "timeout" || status == "error" {
+				status = "failed"
+			}
+			info.Status = status
+			info.Attempts = 1
+			if entry.ErrorClass != "" {
+				info.LastErr = entry.ErrorClass
+			} else if entry.ErrorMessage != "" {
+				info.LastErr = entry.ErrorMessage
+			} else {
+				info.LastErr = entry.Status
+			}
+			return info
+		}
+	}
+
+	// Priority 4: dep-based blocking; fallback to pending.
+	if hasUnfinishedDeps(t.Needs, doneSet) {
+		info.Status = "blocked"
+	} else {
+		info.Status = "pending"
+	}
+	return info
+}
+
 func runStatus(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
+	format := fs.String("format", "", "output format (json)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -906,71 +1038,111 @@ func runStatus(args []string, stdout io.Writer) error {
 		return err
 	}
 
-	// Build done set by checking for done markers
+	doneDir := ".kiln/done"
+	logDir := ".kiln/logs"
+
+	// Build done set by checking for done markers.
 	doneSet := make(map[string]bool)
 	for _, t := range tasks {
-		donePath := filepath.Join(".kiln", "done", t.ID+".done")
-		if _, err := os.Stat(donePath); err == nil {
+		if _, statErr := os.Stat(filepath.Join(doneDir, t.ID+".done")); statErr == nil {
 			doneSet[t.ID] = true
 		}
 	}
 
-	// Load state.json for additional per-task info (attempts, last error).
-	// Ignore errors — treat as empty state.
+	// Load state.json; ignore errors (treat as empty).
 	state, _ := loadState(".kiln/state.json")
 	if state == nil {
 		state = &StateManifest{Tasks: make(map[string]*TaskState)}
 	}
 
-	// Classify and print
-	var doneCount, runnableCount int
-	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-10s %-10s %-40s %s\n", "TASK", "STATUS", "ATTEMPTS", "KIND", "PHASE", "LAST ERROR", "NEEDS")
-	fmt.Fprintf(stdout, "%-30s %-10s %-8s %-10s %-10s %-40s %s\n", "----", "------", "--------", "----", "-----", "----------", "-----")
-
+	// Derive display info for each task.
+	infos := make([]taskStatusInfo, 0, len(tasks))
+	counts := map[string]int{
+		"complete": 0, "failed": 0, "not_complete": 0,
+		"blocked": 0, "pending": 0, "running": 0,
+	}
 	for _, t := range tasks {
-		var status string
-		if doneSet[t.ID] {
-			status = "done"
-			doneCount++
-		} else if hasUnfinishedDeps(t.Needs, doneSet) {
-			status = "blocked"
-		} else {
-			status = "runnable"
-			runnableCount++
+		info := deriveTaskStatus(t, state, logDir, doneDir, doneSet)
+		if info.LastErr == "" {
+			info.LastErr = "-"
 		}
+		counts[info.Status]++
+		infos = append(infos, info)
+	}
+
+	// JSON output.
+	if *format == "json" {
+		type jsonSummary struct {
+			Total       int `json:"total"`
+			Complete    int `json:"complete"`
+			Failed      int `json:"failed"`
+			NotComplete int `json:"not_complete"`
+			Blocked     int `json:"blocked"`
+			Pending     int `json:"pending"`
+			Running     int `json:"running"`
+		}
+		type jsonOutput struct {
+			Tasks   []taskStatusInfo `json:"tasks"`
+			Summary jsonSummary      `json:"summary"`
+		}
+		out := jsonOutput{
+			Tasks: infos,
+			Summary: jsonSummary{
+				Total:       len(tasks),
+				Complete:    counts["complete"],
+				Failed:      counts["failed"],
+				NotComplete: counts["not_complete"],
+				Blocked:     counts["blocked"],
+				Pending:     counts["pending"],
+				Running:     counts["running"],
+			},
+		}
+		data, _ := json.Marshal(out)
+		fmt.Fprintln(stdout, string(data))
+		return nil
+	}
+
+	// Human-readable table.
+	fmt.Fprintf(stdout, "%-30s %-12s %-8s %-10s %-10s %-40s %s\n", "TASK", "STATUS", "ATTEMPTS", "KIND", "PHASE", "LAST ERROR", "NEEDS")
+	fmt.Fprintf(stdout, "%-30s %-12s %-8s %-10s %-10s %-40s %s\n", "----", "------", "--------", "----", "-----", "----------", "-----")
+
+	for i, info := range infos {
+		t := tasks[i]
 		needs := strings.Join(t.Needs, ", ")
 		if needs == "" {
 			needs = "-"
 		}
-		var attempts int
-		lastErr := "-"
-		if ts := state.Tasks[t.ID]; ts != nil {
-			attempts = ts.Attempts
-			if ts.LastError != "" {
-				lastErr = ts.LastError
-				if len(lastErr) > 38 {
-					lastErr = lastErr[:37] + "…"
-				}
-			}
-		}
-		kind := t.Kind
+		kind := info.Kind
 		if kind == "" {
 			kind = "-"
 		}
 		if len(kind) > 10 {
 			kind = kind[:9] + "…"
 		}
-		phase := t.Phase
+		phase := info.Phase
 		if phase == "" {
 			phase = "-"
 		}
 		if len(phase) > 10 {
 			phase = phase[:9] + "…"
 		}
-		fmt.Fprintf(stdout, "%-30s %-10s %-8d %-10s %-10s %-40s %s\n", t.ID, status, attempts, kind, phase, lastErr, needs)
+		lastErr := info.LastErr
+		if lastErr != "-" && len(lastErr) > 38 {
+			lastErr = lastErr[:37] + "…"
+		}
+		fmt.Fprintf(stdout, "%-30s %-12s %-8d %-10s %-10s %-40s %s\n",
+			info.ID, info.Status, info.Attempts, kind, phase, lastErr, needs)
 	}
 
+	// Backward-compat summary: "pending" tasks are those ready to run (was "runnable").
+	doneCount := counts["complete"]
+	runnableCount := counts["pending"]
 	fmt.Fprintf(stdout, "\n%d/%d tasks done, %d runnable\n", doneCount, len(tasks), runnableCount)
+
+	// Spec summary line.
+	fmt.Fprintf(stdout, "\nSummary\n-------\nTotal: %d | Complete: %d | Failed: %d | Not Complete: %d | Pending: %d | Blocked: %d\n",
+		len(tasks), counts["complete"], counts["failed"], counts["not_complete"], counts["pending"], counts["blocked"])
+
 	return nil
 }
 
@@ -1333,7 +1505,8 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		// Update state to "failed" after an error attempt.
 		ts.Status = "failed"
 		ts.LastError = err.Error()
-		ts.LastErrorClass = classifyError(err)
+		errClass, _ := classify(err)
+		ts.LastErrorClass = errClass
 		if saveErr := saveState(stateFile, state); saveErr != nil {
 			fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
 		}
@@ -1408,22 +1581,33 @@ func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, s
 		if ctx.Err() == context.DeadlineExceeded {
 			entry.Status = "timeout"
 			entry.ExitCode = 20
-			return entry, &timeoutError{taskID: taskID, timeout: timeout}
+			te := &timeoutError{taskID: taskID, timeout: timeout}
+			entry.ErrorClass = ErrClassTimeout
+			entry.ErrorMessage = te.Error()
+			entry.Retryable = true
+			return entry, te
 		}
 		entry.Status = "error"
 		entry.ExitCode = 1
-		return entry, &claudeExitError{err: runErr}
+		ce := &claudeExitError{err: runErr}
+		entry.ErrorClass = ErrClassClaudeExit
+		entry.ErrorMessage = ce.Error()
+		entry.Retryable = true
+		return entry, ce
 	}
 
 	footerStatus, footerTaskID, ok := parseFooter(capturedBuf.String())
 	if !ok {
 		entry.Status = "error"
 		entry.ExitCode = 10
-		return entry, &footerError{msg: fmt.Sprintf(
+		fe := &footerError{msg: fmt.Sprintf(
 			"missing or invalid footer in claude output\n"+
 				`expected format: {"kiln":{"status":"complete|not_complete|blocked","task_id":"%s"}}`,
 			taskID,
 		)}
+		entry.ErrorClass = ErrClassFooterParse
+		entry.ErrorMessage = fe.Error()
+		return entry, fe
 	}
 
 	entry.Footer = &kilnFooterEnvelope{Kiln: kilnFooterPayload{Status: footerStatus, TaskID: footerTaskID}}
@@ -1449,8 +1633,735 @@ func execOnce(taskID, prompt, model, promptFile string, timeout time.Duration, s
 	default:
 		entry.Status = "error"
 		entry.ExitCode = 10
-		return entry, &footerError{msg: fmt.Sprintf(
-			"invalid footer status %q; expected complete, not_complete, or blocked", footerStatus,
+		fe := &footerError{
+			msg: fmt.Sprintf(
+				"invalid footer status %q; expected complete, not_complete, or blocked", footerStatus,
+			),
+			isValidation: true,
+		}
+		entry.ErrorClass = ErrClassFooterValidation
+		entry.ErrorMessage = fe.Error()
+		return entry, fe
+	}
+}
+
+// decisionLedgerEntry is a JSON Lines record appended to .kiln/decisions.log.
+type decisionLedgerEntry struct {
+	TaskID       string `json:"task_id"`
+	Timestamp    string `json:"timestamp"`
+	ArtifactPath string `json:"artifact_path"`
+	Model        string `json:"model"`
+}
+
+// appendDecisionLedger appends a JSON Lines entry to the decisions log file.
+func appendDecisionLedger(ledgerPath string, entry decisionLedgerEntry) error {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("failed to marshal decision ledger entry: %w", err)
+	}
+	f, err := os.OpenFile(ledgerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to open decision ledger: %w", err)
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\n", data)
+	return err
+}
+
+// stripFooter removes the last kiln JSON footer line from the output string.
+// Returns the content before the footer, with trailing blank lines trimmed.
+func stripFooter(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.Contains(line, `"kiln"`) {
+			continue
+		}
+		var env kilnFooterEnvelope
+		if json.Unmarshal([]byte(line), &env) == nil && env.Kiln.Status != "" {
+			prefix := lines[:i]
+			for len(prefix) > 0 && strings.TrimSpace(prefix[len(prefix)-1]) == "" {
+				prefix = prefix[:len(prefix)-1]
+			}
+			return strings.Join(prefix, "\n")
+		}
+	}
+	return strings.TrimRight(output, "\n")
+}
+
+// readLogSummary reads an execRunLog file and returns a human-readable one-line summary.
+func readLogSummary(logPath string) string {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return "(no execution log found)"
+	}
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return "(failed to parse execution log)"
+	}
+	return fmt.Sprintf("status=%s duration_ms=%d model=%s exit_code=%d",
+		entry.Status, entry.DurationMs, entry.Model, entry.ExitCode)
+}
+
+// buildUnifyPrompt constructs the structured prompt for UNIFY closure artifact generation.
+func buildUnifyPrompt(taskID, taskPromptContent, logSummary string) string {
+	return fmt.Sprintf(`You are generating a closure artifact for kiln task "%s".
+
+A closure artifact is a semantic summary of what actually happened during task execution,
+bridging the gap between "task ran" and "task is fully reconciled".
+
+## Original Task Prompt
+
+%s
+
+## Execution Log Summary
+
+%s
+
+## Your Job
+
+Inspect the current repository state (run git status, git log --oneline -10, and
+git diff HEAD~1 or similar to understand what changed during this task), then produce
+a structured closure summary with these sections:
+
+### What Changed
+List files modified, functions added/removed, and key code changes made during this task.
+
+### What's Incomplete or Deferred
+List any known gaps, TODOs left in code, or work explicitly deferred.
+
+### Decisions Made
+List key design decisions made during this task and their rationale.
+
+### Handoff Notes
+What does the next developer (or downstream task) need to know?
+Include any important context, caveats, or gotchas.
+
+### Acceptance Criteria Coverage
+If the original task prompt contains acceptance criteria, assess each criterion:
+- MET: <criterion>
+- UNMET: <criterion>
+
+## Output Format
+
+Write your closure summary in Markdown. Be specific and concrete.
+End your response with EXACTLY this JSON footer on its own line:
+
+{"kiln":{"status":"complete","task_id":"%s"}}
+
+If you cannot produce a meaningful closure (e.g. cannot access git history), use:
+{"kiln":{"status":"not_complete","task_id":"%s"}}`, taskID, taskPromptContent, logSummary, taskID, taskID)
+}
+
+// runUnify implements the `kiln unify` subcommand.
+// It generates a closure artifact for a completed task via a single-shot Claude invocation.
+func runUnify(args []string, stdout io.Writer) (int, error) {
+	fs := flag.NewFlagSet("unify", flag.ContinueOnError)
+	taskID := fs.String("task-id", "", "task identifier (kebab-case)")
+	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
+	timeoutStr := fs.String("timeout", "10m", "maximum duration for the claude invocation")
+
+	if err := fs.Parse(args); err != nil {
+		return 1, err
+	}
+
+	if *taskID == "" {
+		return 1, fmt.Errorf("--task-id is required")
+	}
+	if !taskIDRegexp.MatchString(*taskID) {
+		return 1, fmt.Errorf("--task-id %q must be kebab-case", *taskID)
+	}
+
+	timeout, err := time.ParseDuration(*timeoutStr)
+	if err != nil {
+		return 1, fmt.Errorf("invalid --timeout value: %w", err)
+	}
+
+	// Check task completion: try state.json first, then .done marker.
+	stateFile := ".kiln/state.json"
+	state, _ := loadState(stateFile)
+
+	taskCompleted := false
+	if state != nil {
+		if ts := state.Tasks[*taskID]; ts != nil && ts.Status == "completed" {
+			taskCompleted = true
+		}
+	}
+	if !taskCompleted {
+		donePath := filepath.Join(".kiln", "done", *taskID+".done")
+		if _, statErr := os.Stat(donePath); statErr == nil {
+			taskCompleted = true
+		}
+	}
+	if !taskCompleted {
+		return 2, fmt.Errorf("task %q is not completed: check .kiln/done/%s.done or state.json", *taskID, *taskID)
+	}
+
+	// Read task prompt file (convention: .kiln/prompts/tasks/<task-id>.md).
+	promptFilePath := filepath.Join(".kiln", "prompts", "tasks", *taskID+".md")
+	promptBytes, readErr := os.ReadFile(promptFilePath)
+	var taskPromptContent string
+	if readErr != nil {
+		taskPromptContent = fmt.Sprintf("(prompt file not found at %s)", promptFilePath)
+	} else {
+		taskPromptContent = string(promptBytes)
+	}
+
+	// Read execution log summary.
+	logPath := filepath.Join(".kiln", "logs", *taskID+".json")
+	logSummary := readLogSummary(logPath)
+
+	model := resolveModel(*modelFlag, "")
+
+	// Build the unify prompt.
+	unifyPrompt := buildUnifyPrompt(*taskID, taskPromptContent, logSummary)
+
+	// Single-shot Claude invocation (no retry loop).
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var capturedBuf bytes.Buffer
+	cmd := commandBuilder(ctx, unifyPrompt, model)
+	cmd.Stdout = io.MultiWriter(stdout, &capturedBuf)
+	cmd.Stderr = stdout
+
+	if runErr := cmd.Run(); runErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return 2, fmt.Errorf("timed out after %s", timeout)
+		}
+		return 1, fmt.Errorf("claude invocation failed: %w", runErr)
+	}
+
+	output := capturedBuf.String()
+
+	// Parse footer using existing parseFooter function.
+	footerStatus, _, ok := parseFooter(output)
+	if !ok {
+		fmt.Fprintf(stdout, "unify: raw output logged above\n")
+		return 10, &footerError{msg: fmt.Sprintf(
+			"missing or invalid footer in claude output for task %q\n"+
+				`expected: {"kiln":{"status":"complete","task_id":"%s"}}`,
+			*taskID, *taskID,
 		)}
 	}
+
+	if footerStatus != "complete" {
+		return 2, fmt.Errorf("claude returned status %q for task %q (expected 'complete')", footerStatus, *taskID)
+	}
+
+	// Write closure artifact to .kiln/unify/<task-id>.md.
+	unifyDir := ".kiln/unify"
+	if err := os.MkdirAll(unifyDir, 0o755); err != nil {
+		return 1, fmt.Errorf("failed to create unify directory: %w", err)
+	}
+
+	artifactPath := filepath.Join(unifyDir, *taskID+".md")
+	artifactContent := stripFooter(output)
+	if err := os.WriteFile(artifactPath, []byte(artifactContent), 0o644); err != nil {
+		return 1, fmt.Errorf("failed to write closure artifact: %w", err)
+	}
+
+	// Append entry to decision ledger (.kiln/decisions.log).
+	ledgerPath := ".kiln/decisions.log"
+	ledgerEntry := decisionLedgerEntry{
+		TaskID:       *taskID,
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		ArtifactPath: artifactPath,
+		Model:        model,
+	}
+	if ledgerErr := appendDecisionLedger(ledgerPath, ledgerEntry); ledgerErr != nil {
+		fmt.Fprintf(stdout, "warning: failed to append decision ledger: %v\n", ledgerErr)
+	}
+
+	fmt.Fprintf(stdout, "unify: closure artifact written to %s\n", artifactPath)
+	return 0, nil
+}
+
+// --- kiln report ---
+
+// taskReportEntry holds per-task data for the report command.
+type taskReportEntry struct {
+	TaskID         string `json:"task_id"`
+	Status         string `json:"status"`
+	Attempts       int    `json:"attempts"`
+	LastErrorClass string `json:"last_error_class,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+}
+
+// reportSummary holds aggregate statistics for the report command.
+type reportSummary struct {
+	Total       int            `json:"total"`
+	Complete    int            `json:"complete"`
+	Failed      int            `json:"failed"`
+	NotComplete int            `json:"not_complete"`
+	Blocked     int            `json:"blocked"`
+	Attempts    int            `json:"total_attempts"`
+	TopErrors   map[string]int `json:"top_errors,omitempty"`
+}
+
+// reportData is the full structured output for the report command.
+type reportData struct {
+	Tasks   []taskReportEntry `json:"tasks"`
+	Summary reportSummary     `json:"summary"`
+}
+
+// logStatusToDisplayStatus maps an execRunLog status to a report-facing display status.
+func logStatusToDisplayStatus(status string) string {
+	switch status {
+	case "complete":
+		return "complete"
+	case "not_complete":
+		return "not_complete"
+	case "blocked":
+		return "blocked"
+	default:
+		// "timeout", "error", and any unknown status are all displayed as "failed".
+		return "failed"
+	}
+}
+
+func runReport(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	format := fs.String("format", "table", "output format: table or json")
+	logDir := fs.String("log-dir", ".kiln/logs", "path to logs directory")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *format != "table" && *format != "json" {
+		return fmt.Errorf("invalid --format value %q: must be table or json", *format)
+	}
+
+	// Read all log files.
+	dirEntries, err := os.ReadDir(*logDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(stdout, "No execution logs found in .kiln/logs/")
+			return nil
+		}
+		return fmt.Errorf("failed to read log directory: %w", err)
+	}
+
+	var logs []execRunLog
+	for _, de := range dirEntries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(*logDir, de.Name()))
+		if readErr != nil {
+			continue
+		}
+		var entry execRunLog
+		if jsonErr := json.Unmarshal(data, &entry); jsonErr != nil {
+			continue
+		}
+		logs = append(logs, entry)
+	}
+
+	if len(logs) == 0 {
+		fmt.Fprintln(stdout, "No execution logs found in .kiln/logs/")
+		return nil
+	}
+
+	// Load state for attempt counts (best-effort; ignore errors).
+	state, _ := loadState(".kiln/state.json")
+	if state == nil {
+		state = &StateManifest{Tasks: make(map[string]*TaskState)}
+	}
+
+	// Build report.
+	summary := reportSummary{TopErrors: make(map[string]int)}
+	tasks := make([]taskReportEntry, 0, len(logs))
+
+	for _, log := range logs {
+		displayStatus := logStatusToDisplayStatus(log.Status)
+		attempts := 0
+		if ts := state.Tasks[log.TaskID]; ts != nil {
+			attempts = ts.Attempts
+		}
+
+		tasks = append(tasks, taskReportEntry{
+			TaskID:         log.TaskID,
+			Status:         displayStatus,
+			Attempts:       attempts,
+			LastErrorClass: log.ErrorClass,
+			LastError:      log.ErrorMessage,
+		})
+
+		summary.Total++
+		summary.Attempts += attempts
+		switch displayStatus {
+		case "complete":
+			summary.Complete++
+		case "failed":
+			summary.Failed++
+		case "not_complete":
+			summary.NotComplete++
+		case "blocked":
+			summary.Blocked++
+		}
+		if log.ErrorClass != "" {
+			summary.TopErrors[log.ErrorClass]++
+		}
+	}
+
+	if len(summary.TopErrors) == 0 {
+		summary.TopErrors = nil
+	}
+
+	report := reportData{Tasks: tasks, Summary: summary}
+
+	if *format == "json" {
+		data, marshalErr := json.MarshalIndent(report, "", "  ")
+		if marshalErr != nil {
+			return fmt.Errorf("failed to marshal report: %w", marshalErr)
+		}
+		fmt.Fprintln(stdout, string(data))
+		return nil
+	}
+
+	printReport(stdout, report)
+	return nil
+}
+
+// printReport writes a human-readable table report to w.
+func printReport(w io.Writer, r reportData) {
+	fmt.Fprintf(w, "%-20s %-13s %-9s %-18s %s\n", "Task", "Status", "Attempts", "Last Error Class", "Last Error")
+	fmt.Fprintf(w, "%-20s %-13s %-9s %-18s %s\n", "----", "------", "--------", "----------------", "----------")
+
+	for _, t := range r.Tasks {
+		errClass := t.LastErrorClass
+		if errClass == "" {
+			errClass = "-"
+		}
+		lastErr := t.LastError
+		if lastErr == "" {
+			lastErr = "-"
+		}
+		if len(lastErr) > 40 {
+			lastErr = lastErr[:39] + "…"
+		}
+		fmt.Fprintf(w, "%-20s %-13s %-9d %-18s %s\n", t.TaskID, t.Status, t.Attempts, errClass, lastErr)
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Summary")
+	fmt.Fprintln(w, "-------")
+	fmt.Fprintf(w, "Total: %d | Complete: %d | Failed: %d | Not Complete: %d | Blocked: %d\n",
+		r.Summary.Total, r.Summary.Complete, r.Summary.Failed, r.Summary.NotComplete, r.Summary.Blocked)
+	fmt.Fprintf(w, "Attempts: %d\n", r.Summary.Attempts)
+
+	if len(r.Summary.TopErrors) > 0 {
+		parts := make([]string, 0, len(r.Summary.TopErrors))
+		for cls, count := range r.Summary.TopErrors {
+			parts = append(parts, fmt.Sprintf("%s (%d)", cls, count))
+		}
+		sort.Strings(parts)
+		fmt.Fprintf(w, "Top errors: %s\n", strings.Join(parts, ", "))
+	}
+}
+
+// --- kiln retry ---
+
+func runRetry(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("retry", flag.ContinueOnError)
+	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
+	taskID := fs.String("task-id", "", "retry a specific task by ID")
+	failedOnly := fs.Bool("failed", false, "retry only tasks with failed status")
+	transientOnly := fs.Bool("transient-only", false, "with --failed, retry only retryable errors (requires error_class in log)")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	doneDir := ".kiln/done"
+	logDir := ".kiln/logs"
+
+	doneSet := make(map[string]bool)
+	for _, t := range tasks {
+		if _, statErr := os.Stat(filepath.Join(doneDir, t.ID+".done")); statErr == nil {
+			doneSet[t.ID] = true
+		}
+	}
+
+	state, _ := loadState(".kiln/state.json")
+	if state == nil {
+		state = &StateManifest{Tasks: make(map[string]*TaskState)}
+	}
+
+	// Determine which tasks to retry.
+	var toRetry []Task
+	for _, t := range tasks {
+		// If a specific task ID is requested, only consider that one.
+		if *taskID != "" && t.ID != *taskID {
+			continue
+		}
+
+		info := deriveTaskStatus(t, state, logDir, doneDir, doneSet)
+
+		// Skip complete and pending tasks (only retry tasks that attempted but didn't complete).
+		if info.Status == "complete" || info.Status == "pending" {
+			continue
+		}
+
+		if *failedOnly && info.Status != "failed" {
+			continue
+		}
+
+		if *transientOnly {
+			if *failedOnly {
+				// Check if the error is retryable via log file error_class.
+				logPath := filepath.Join(logDir, t.ID+".json")
+				data, readErr := os.ReadFile(logPath)
+				if readErr != nil {
+					// No log file to check retryability; warn and skip.
+					fmt.Fprintf(stdout, "warning: cannot check retryability for task %s (no log file); skipping\n", t.ID)
+					continue
+				}
+				var entry execRunLog
+				if json.Unmarshal(data, &entry) != nil {
+					fmt.Fprintf(stdout, "warning: cannot parse log for task %s; skipping\n", t.ID)
+					continue
+				}
+				if !entry.Retryable {
+					continue
+				}
+			} else {
+				fmt.Fprintf(stdout, "warning: --transient-only has no effect without --failed\n")
+			}
+		}
+
+		toRetry = append(toRetry, t)
+	}
+
+	if len(toRetry) == 0 {
+		fmt.Fprintln(stdout, "No tasks match retry criteria.")
+		return nil
+	}
+
+	// Print which tasks will be retried.
+	ids := make([]string, len(toRetry))
+	for i, t := range toRetry {
+		ids[i] = t.ID
+	}
+	fmt.Fprintf(stdout, "Retrying %d task(s): %s\n", len(toRetry), strings.Join(ids, ", "))
+
+	// Retry each task.
+	for _, t := range toRetry {
+		// Remove done marker so Make (and exec) don't skip.
+		donePath := filepath.Join(doneDir, t.ID+".done")
+		_ = os.Remove(donePath)
+
+		execArgs := []string{"--task-id", t.ID, "--tasks", *tasksFile}
+		if _, execErr := runExec(execArgs, stdout); execErr != nil {
+			fmt.Fprintf(stdout, "retry: task %s failed: %v\n", t.ID, execErr)
+		}
+	}
+
+	return nil
+}
+
+// --- kiln reset ---
+
+func runReset(args []string, stdin io.Reader, stdout io.Writer) error {
+	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
+	taskID := fs.String("task-id", "", "task ID to reset")
+	all := fs.Bool("all", false, "reset all tasks (requires confirmation)")
+	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *taskID == "" && !*all {
+		return fmt.Errorf("--task-id or --all is required")
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	taskIndex := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		taskIndex[t.ID] = true
+	}
+
+	if *all {
+		// Prompt for confirmation.
+		fmt.Fprintf(stdout, "Reset all %d tasks? [y/N] ", len(tasks))
+		buf := make([]byte, 8)
+		n, _ := stdin.Read(buf)
+		answer := strings.TrimSpace(strings.ToLower(string(buf[:n])))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(stdout, "Aborted.")
+			return nil
+		}
+		for _, t := range tasks {
+			if err := resetTask(t.ID, stdout); err != nil {
+				fmt.Fprintf(stdout, "warning: reset task %s: %v\n", t.ID, err)
+			}
+		}
+		// Clear state.json entirely.
+		clearAllState()
+		return nil
+	}
+
+	// Single task reset.
+	if !taskIndex[*taskID] {
+		fmt.Fprintf(stdout, "Unknown task: %s\n", *taskID)
+		return fmt.Errorf("unknown task: %s", *taskID)
+	}
+	return resetTask(*taskID, stdout)
+}
+
+// resetTask removes the done marker and archives the log for a single task,
+// and removes the task's entry from state.json.
+func resetTask(id string, stdout io.Writer) error {
+	doneDir := ".kiln/done"
+	logDir := ".kiln/logs"
+	stateFile := ".kiln/state.json"
+
+	// Remove done marker.
+	donePath := filepath.Join(doneDir, id+".done")
+	_ = os.Remove(donePath)
+
+	// Archive log file.
+	logPath := filepath.Join(logDir, id+".json")
+	bakPath := logPath + ".bak"
+	if _, err := os.Stat(logPath); err == nil {
+		if renameErr := os.Rename(logPath, bakPath); renameErr != nil {
+			// Try copy+delete as fallback.
+			if data, readErr := os.ReadFile(logPath); readErr == nil {
+				_ = os.WriteFile(bakPath, data, 0o644)
+				_ = os.Remove(logPath)
+			}
+		}
+	}
+
+	// Remove task entry from state.json.
+	state, _ := loadState(stateFile)
+	if state != nil {
+		delete(state.Tasks, id)
+		_ = saveState(stateFile, state)
+	}
+
+	fmt.Fprintf(stdout, "Reset task: %s (done marker removed, logs archived)\n", id)
+	return nil
+}
+
+// clearAllState removes all task entries from state.json.
+func clearAllState() {
+	stateFile := ".kiln/state.json"
+	state, _ := loadState(stateFile)
+	if state != nil {
+		state.Tasks = make(map[string]*TaskState)
+		_ = saveState(stateFile, state)
+	}
+}
+
+// --- kiln resume ---
+
+func runResume(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	taskID := fs.String("task-id", "", "task ID to resume")
+	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *taskID == "" {
+		return fmt.Errorf("--task-id is required")
+	}
+
+	tasks, err := loadTasks(*tasksFile)
+	if err != nil {
+		return err
+	}
+
+	// Find the task.
+	var found *Task
+	for i := range tasks {
+		if tasks[i].ID == *taskID {
+			found = &tasks[i]
+			break
+		}
+	}
+	if found == nil {
+		fmt.Fprintf(stdout, "Unknown task: %s\n", *taskID)
+		return fmt.Errorf("unknown task: %s", *taskID)
+	}
+
+	// Load state for attempt count and last error.
+	state, _ := loadState(".kiln/state.json")
+	if state == nil {
+		state = &StateManifest{Tasks: make(map[string]*TaskState)}
+	}
+
+	logDir := ".kiln/logs"
+	logPath := filepath.Join(logDir, *taskID+".json")
+
+	// Determine attempt count and last error.
+	var attemptCount int
+	var lastStatus, lastError string
+
+	if ts := state.Tasks[*taskID]; ts != nil {
+		attemptCount = ts.Attempts
+		lastStatus = ts.Status
+		lastError = ts.LastError
+	} else {
+		// Fall back to log file.
+		if data, readErr := os.ReadFile(logPath); readErr == nil {
+			var entry execRunLog
+			if json.Unmarshal(data, &entry) == nil {
+				attemptCount = 1
+				lastStatus = entry.Status
+				lastError = entry.ErrorMessage
+			}
+		}
+	}
+
+	if attemptCount == 0 {
+		fmt.Fprintf(stdout, "No prior attempts found for task: %s. Use 'kiln exec' instead.\n", *taskID)
+		return nil
+	}
+
+	// Read original prompt.
+	promptData, err := os.ReadFile(found.Prompt)
+	if err != nil {
+		return fmt.Errorf("failed to read prompt file %q: %w", found.Prompt, err)
+	}
+
+	// Build resume output.
+	var buf strings.Builder
+
+	buf.WriteString("# RESUME CONTEXT\n\n")
+	fmt.Fprintf(&buf, "Task ID: %s\n", *taskID)
+	fmt.Fprintf(&buf, "Prior attempts: %d\n", attemptCount)
+	fmt.Fprintf(&buf, "Last status: %s\n", lastStatus)
+	if lastError != "" {
+		fmt.Fprintf(&buf, "Last error: %s\n", lastError)
+	}
+	buf.WriteString("\n")
+
+	// Include closure artifact if available.
+	unifyPath := filepath.Join(".kiln", "unify", *taskID+".md")
+	if data, readErr := os.ReadFile(unifyPath); readErr == nil {
+		buf.WriteString("# PREVIOUS CLOSURE SUMMARY\n\n")
+		buf.Write(data)
+		buf.WriteString("\n\n")
+	}
+
+	buf.WriteString("# ORIGINAL TASK PROMPT\n\n")
+	buf.Write(promptData)
+
+	fmt.Fprint(stdout, buf.String())
+	return nil
 }

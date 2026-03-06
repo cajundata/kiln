@@ -682,6 +682,13 @@ func TestHelperProcess(t *testing.T) {
 		taskID := taskIDFromEnv()
 		os.Stdout.WriteString(`{"kiln":{"status":"complete","task_id":"` + taskID + `"}}` + "\n")
 		os.Exit(0)
+	case "unify-success":
+		// Write markdown closure content followed by a complete footer.
+		taskID := taskIDFromEnv()
+		os.Stdout.WriteString("## What Changed\n\nSome files were modified.\n\n")
+		os.Stdout.WriteString("## Decisions Made\n\nUsed the simplest approach.\n\n")
+		os.Stdout.WriteString(`{"kiln":{"status":"complete","task_id":"` + taskID + `"}}` + "\n")
+		os.Exit(0)
 	default:
 		os.Stderr.WriteString("unknown helper mode\n")
 		os.Exit(2)
@@ -3793,29 +3800,33 @@ func TestSaveState_AtomicWrite(t *testing.T) {
 
 func TestClassifyError_Timeout(t *testing.T) {
 	err := &timeoutError{taskID: "t1", timeout: time.Minute}
-	if got := classifyError(err); got != "timeout" {
-		t.Errorf("expected timeout, got %s", got)
+	got, _ := classify(err)
+	if got != ErrClassTimeout {
+		t.Errorf("expected %s, got %s", ErrClassTimeout, got)
 	}
 }
 
 func TestClassifyError_ClaudeExit(t *testing.T) {
 	err := &claudeExitError{err: errors.New("exit 1")}
-	if got := classifyError(err); got != "claude_exit" {
-		t.Errorf("expected claude_exit, got %s", got)
+	got, _ := classify(err)
+	if got != ErrClassClaudeExit {
+		t.Errorf("expected %s, got %s", ErrClassClaudeExit, got)
 	}
 }
 
 func TestClassifyError_FooterInvalid(t *testing.T) {
 	err := &footerError{msg: "missing footer"}
-	if got := classifyError(err); got != "footer_invalid" {
-		t.Errorf("expected footer_invalid, got %s", got)
+	got, _ := classify(err)
+	if got != ErrClassFooterParse {
+		t.Errorf("expected %s, got %s", ErrClassFooterParse, got)
 	}
 }
 
 func TestClassifyError_Permanent(t *testing.T) {
 	err := errors.New("some other error")
-	if got := classifyError(err); got != "permanent" {
-		t.Errorf("expected permanent, got %s", got)
+	got, _ := classify(err)
+	if got != ErrClassUnknown {
+		t.Errorf("expected %s, got %s", ErrClassUnknown, got)
 	}
 }
 
@@ -4817,5 +4828,1770 @@ func TestAtomicLogWrite_ConcurrentWritesSafe(t *testing.T) {
 		if entry.TaskID != fmt.Sprintf("task-%d", i) {
 			t.Errorf("task-%d.json has wrong task_id: %s", i, entry.TaskID)
 		}
+	}
+}
+
+// --- Tests for error taxonomy (classify, error class constants, execRunLog fields) ---
+
+func TestClassify_Nil(t *testing.T) {
+	ec, ret := classify(nil)
+	if ec != "" {
+		t.Errorf("expected empty class for nil error, got %q", ec)
+	}
+	if ret {
+		t.Error("expected retryable=false for nil error")
+	}
+}
+
+func TestClassify_TimeoutError(t *testing.T) {
+	err := &timeoutError{taskID: "t1", timeout: 5 * time.Second}
+	ec, ret := classify(err)
+	if ec != ErrClassTimeout {
+		t.Errorf("expected %q, got %q", ErrClassTimeout, ec)
+	}
+	if !ret {
+		t.Error("expected retryable=true for timeoutError")
+	}
+}
+
+func TestClassify_ClaudeExitError(t *testing.T) {
+	err := &claudeExitError{err: errors.New("exit status 1")}
+	ec, ret := classify(err)
+	if ec != ErrClassClaudeExit {
+		t.Errorf("expected %q, got %q", ErrClassClaudeExit, ec)
+	}
+	if !ret {
+		t.Error("expected retryable=true for claudeExitError")
+	}
+}
+
+func TestClassify_FooterParseError(t *testing.T) {
+	err := &footerError{msg: "missing footer", isValidation: false}
+	ec, ret := classify(err)
+	if ec != ErrClassFooterParse {
+		t.Errorf("expected %q, got %q", ErrClassFooterParse, ec)
+	}
+	if ret {
+		t.Error("expected retryable=false for footer parse error")
+	}
+}
+
+func TestClassify_FooterValidationError(t *testing.T) {
+	err := &footerError{msg: "invalid status", isValidation: true}
+	ec, ret := classify(err)
+	if ec != ErrClassFooterValidation {
+		t.Errorf("expected %q, got %q", ErrClassFooterValidation, ec)
+	}
+	if ret {
+		t.Error("expected retryable=false for footer validation error")
+	}
+}
+
+func TestClassify_LockConflictError(t *testing.T) {
+	err := &lockConflictError{TaskID: "t1", LockPath: "/tmp/t1.lock", Holder: lockInfo{PID: 42}}
+	ec, ret := classify(err)
+	if ec != ErrClassLockConflict {
+		t.Errorf("expected %q, got %q", ErrClassLockConflict, ec)
+	}
+	if ret {
+		t.Error("expected retryable=false for lockConflictError")
+	}
+}
+
+func TestClassify_UnknownError(t *testing.T) {
+	err := errors.New("some unknown error")
+	ec, ret := classify(err)
+	if ec != ErrClassUnknown {
+		t.Errorf("expected %q, got %q", ErrClassUnknown, ec)
+	}
+	if ret {
+		t.Error("expected retryable=false for unknown error")
+	}
+}
+
+func TestClassify_DistinguishesFooterParseVsValidation(t *testing.T) {
+	parseErr := &footerError{msg: "parse fail", isValidation: false}
+	validErr := &footerError{msg: "validation fail", isValidation: true}
+	ecParse, _ := classify(parseErr)
+	ecValid, _ := classify(validErr)
+	if ecParse == ecValid {
+		t.Errorf("expected different classes for parse (%q) vs validation (%q) footer errors", ecParse, ecValid)
+	}
+	if ecParse != ErrClassFooterParse {
+		t.Errorf("expected %q for parse, got %q", ErrClassFooterParse, ecParse)
+	}
+	if ecValid != ErrClassFooterValidation {
+		t.Errorf("expected %q for validation, got %q", ErrClassFooterValidation, ecValid)
+	}
+}
+
+func TestExecLog_ErrorClass_OnTimeout(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("hang")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{"--task-id", "ec-timeout", "--prompt-file", promptPath, "--timeout", "200ms"}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "ec-timeout")
+	if entry.ErrorClass != ErrClassTimeout {
+		t.Errorf("expected error_class=%q, got %q", ErrClassTimeout, entry.ErrorClass)
+	}
+	if entry.ErrorMessage == "" {
+		t.Error("expected non-empty error_message on timeout")
+	}
+	if !entry.Retryable {
+		t.Error("expected retryable=true for timeout")
+	}
+}
+
+func TestExecLog_ErrorClass_OnClaudeExit(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{"--task-id", "ec-exit", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "ec-exit")
+	if entry.ErrorClass != ErrClassClaudeExit {
+		t.Errorf("expected error_class=%q, got %q", ErrClassClaudeExit, entry.ErrorClass)
+	}
+	if entry.ErrorMessage == "" {
+		t.Error("expected non-empty error_message on claude exit failure")
+	}
+	if !entry.Retryable {
+		t.Error("expected retryable=true for claude exit error")
+	}
+}
+
+func TestExecLog_ErrorClass_OnMissingFooter(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("no_footer")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	runExec([]string{"--task-id", "ec-nofooter", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "ec-nofooter")
+	if entry.ErrorClass != ErrClassFooterParse {
+		t.Errorf("expected error_class=%q, got %q", ErrClassFooterParse, entry.ErrorClass)
+	}
+	if entry.ErrorMessage == "" {
+		t.Error("expected non-empty error_message for missing footer")
+	}
+	if entry.Retryable {
+		t.Error("expected retryable=false for footer parse error")
+	}
+}
+
+func TestExecLog_ErrorClass_EmptyOnSuccess(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "ec-success")
+
+	runExec([]string{"--task-id", "ec-success", "--prompt-file", promptPath}, &bytes.Buffer{})
+
+	entry := readExecLog(t, tmpDir, "ec-success")
+	if entry.ErrorClass != "" {
+		t.Errorf("expected empty error_class on success, got %q", entry.ErrorClass)
+	}
+	if entry.ErrorMessage != "" {
+		t.Errorf("expected empty error_message on success, got %q", entry.ErrorMessage)
+	}
+	if entry.Retryable {
+		t.Error("expected retryable=false (omitted) on success")
+	}
+}
+
+// --- Tests for kiln report ---
+
+func writeLogFile(t *testing.T, dir, taskID string, entry execRunLog) {
+	t.Helper()
+	entry.TaskID = taskID
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("failed to marshal log entry: %v", err)
+	}
+	logDir := filepath.Join(dir, ".kiln", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("failed to create log dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, taskID+".json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write log file: %v", err)
+	}
+}
+
+func TestRunReport_EmptyLogDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	var out bytes.Buffer
+	err := runReport([]string{}, &out)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "No execution logs found") {
+		t.Errorf("expected 'No execution logs found' message, got: %s", out.String())
+	}
+}
+
+func TestRunReport_MissingLogDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	// Don't create .kiln/logs at all.
+	var out bytes.Buffer
+	err := runReport([]string{}, &out)
+	if err != nil {
+		t.Fatalf("expected no error for missing log dir, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "No execution logs found") {
+		t.Errorf("expected 'No execution logs found' message, got: %s", out.String())
+	}
+}
+
+func TestRunReport_TableOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	writeLogFile(t, tmpDir, "setup-db", execRunLog{Status: "complete"})
+	writeLogFile(t, tmpDir, "auth-module", execRunLog{
+		Status:       "timeout",
+		ErrorClass:   ErrClassTimeout,
+		ErrorMessage: "context deadline exceeded",
+	})
+
+	var out bytes.Buffer
+	err := runReport([]string{}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s := out.String()
+
+	// Check header columns
+	for _, col := range []string{"Task", "Status", "Attempts", "Last Error Class", "Last Error"} {
+		if !strings.Contains(s, col) {
+			t.Errorf("expected column %q in output, got:\n%s", col, s)
+		}
+	}
+	// Check task rows
+	if !strings.Contains(s, "setup-db") {
+		t.Errorf("expected setup-db in output, got:\n%s", s)
+	}
+	if !strings.Contains(s, "auth-module") {
+		t.Errorf("expected auth-module in output, got:\n%s", s)
+	}
+	// Check summary
+	if !strings.Contains(s, "Summary") {
+		t.Errorf("expected Summary section, got:\n%s", s)
+	}
+	if !strings.Contains(s, "Total: 2") {
+		t.Errorf("expected Total: 2, got:\n%s", s)
+	}
+	if !strings.Contains(s, "Complete: 1") {
+		t.Errorf("expected Complete: 1, got:\n%s", s)
+	}
+	if !strings.Contains(s, "Failed: 1") {
+		t.Errorf("expected Failed: 1, got:\n%s", s)
+	}
+	if !strings.Contains(s, "timeout") {
+		t.Errorf("expected 'timeout' in top errors, got:\n%s", s)
+	}
+}
+
+func TestRunReport_JSONOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	writeLogFile(t, tmpDir, "task-a", execRunLog{
+		Status:       "complete",
+		ErrorClass:   "",
+		ErrorMessage: "",
+	})
+	writeLogFile(t, tmpDir, "task-b", execRunLog{
+		Status:       "error",
+		ErrorClass:   ErrClassClaudeExit,
+		ErrorMessage: "exit code 1",
+	})
+
+	var out bytes.Buffer
+	err := runReport([]string{"--format", "json"}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var report reportData
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &report); err != nil {
+		t.Fatalf("failed to parse JSON report: %v\noutput: %s", err, out.String())
+	}
+
+	if report.Summary.Total != 2 {
+		t.Errorf("expected total=2, got %d", report.Summary.Total)
+	}
+	if report.Summary.Complete != 1 {
+		t.Errorf("expected complete=1, got %d", report.Summary.Complete)
+	}
+	if report.Summary.Failed != 1 {
+		t.Errorf("expected failed=1, got %d", report.Summary.Failed)
+	}
+	if len(report.Tasks) != 2 {
+		t.Errorf("expected 2 task entries, got %d", len(report.Tasks))
+	}
+}
+
+func TestRunReport_AttemptsFromState(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	writeLogFile(t, tmpDir, "retry-task", execRunLog{
+		Status:       "timeout",
+		ErrorClass:   ErrClassTimeout,
+		ErrorMessage: "timed out",
+	})
+
+	// Write a state.json with 3 attempts.
+	state := &StateManifest{
+		Tasks: map[string]*TaskState{
+			"retry-task": {Status: "failed", Attempts: 3},
+		},
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".kiln"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln", "state.json"), data, 0o644)
+
+	var out bytes.Buffer
+	if err := runReport([]string{"--format", "json"}, &out); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var report reportData
+	json.Unmarshal([]byte(strings.TrimSpace(out.String())), &report)
+	if len(report.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(report.Tasks))
+	}
+	if report.Tasks[0].Attempts != 3 {
+		t.Errorf("expected attempts=3, got %d", report.Tasks[0].Attempts)
+	}
+	if report.Summary.Attempts != 3 {
+		t.Errorf("expected total_attempts=3, got %d", report.Summary.Attempts)
+	}
+}
+
+func TestRunReport_TopErrorClasses(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	writeLogFile(t, tmpDir, "t1", execRunLog{Status: "timeout", ErrorClass: ErrClassTimeout})
+	writeLogFile(t, tmpDir, "t2", execRunLog{Status: "timeout", ErrorClass: ErrClassTimeout})
+	writeLogFile(t, tmpDir, "t3", execRunLog{Status: "error", ErrorClass: ErrClassClaudeExit})
+
+	var out bytes.Buffer
+	runReport([]string{"--format", "json"}, &out)
+
+	var report reportData
+	json.Unmarshal([]byte(strings.TrimSpace(out.String())), &report)
+
+	if report.Summary.TopErrors[ErrClassTimeout] != 2 {
+		t.Errorf("expected timeout count=2, got %d", report.Summary.TopErrors[ErrClassTimeout])
+	}
+	if report.Summary.TopErrors[ErrClassClaudeExit] != 1 {
+		t.Errorf("expected claude_exit count=1, got %d", report.Summary.TopErrors[ErrClassClaudeExit])
+	}
+}
+
+func TestRunReport_InvalidFormat(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	var out bytes.Buffer
+	err := runReport([]string{"--format", "csv"}, &out)
+	if err == nil {
+		t.Fatal("expected error for invalid format, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid --format value") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRunReport_StatusMapping(t *testing.T) {
+	cases := []struct {
+		logStatus     string
+		displayStatus string
+	}{
+		{"complete", "complete"},
+		{"not_complete", "not_complete"},
+		{"blocked", "blocked"},
+		{"timeout", "failed"},
+		{"error", "failed"},
+		{"unknown", "failed"},
+	}
+	for _, tc := range cases {
+		got := logStatusToDisplayStatus(tc.logStatus)
+		if got != tc.displayStatus {
+			t.Errorf("logStatusToDisplayStatus(%q) = %q, want %q", tc.logStatus, got, tc.displayStatus)
+		}
+	}
+}
+
+// --- Tests for kiln unify ---
+
+// setupUnifyDir creates a temp dir with .kiln structure and changes into it.
+// Returns the temp dir path and a cleanup function.
+func setupUnifyDir(t *testing.T) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{".kiln/done", ".kiln/logs", ".kiln/prompts/tasks"} {
+		if err := os.MkdirAll(filepath.Join(tmpDir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tmpDir
+}
+
+func TestRunUnify_MissingTaskID(t *testing.T) {
+	code, err := runUnify([]string{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "--task-id is required") {
+		t.Fatalf("expected --task-id required error, got code=%d err=%v", code, err)
+	}
+}
+
+func TestRunUnify_InvalidTaskID(t *testing.T) {
+	code, err := runUnify([]string{"--task-id", "INVALID ID"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "kebab-case") {
+		t.Fatalf("expected kebab-case error, got code=%d err=%v", code, err)
+	}
+}
+
+func TestRunUnify_TaskNotCompleted(t *testing.T) {
+	setupUnifyDir(t)
+
+	code, err := runUnify([]string{"--task-id", "my-task"}, &bytes.Buffer{})
+	if code != 2 {
+		t.Fatalf("expected exit code 2 for incomplete task, got %d", code)
+	}
+	if err == nil || !strings.Contains(err.Error(), "not completed") {
+		t.Fatalf("expected 'not completed' error, got: %v", err)
+	}
+}
+
+func TestRunUnify_TaskCompletedViaDoneMarker(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "my-task")
+
+	// Create .done marker.
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/my-task.done"), nil, 0o644)
+
+	var out bytes.Buffer
+	code, err := runUnify([]string{"--task-id", "my-task"}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; output: %s", code, out.String())
+	}
+}
+
+func TestRunUnify_TaskCompletedViaStateJSON(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "state-task")
+
+	// Write state.json with completed status.
+	state := &StateManifest{Tasks: map[string]*TaskState{
+		"state-task": {Status: "completed"},
+	}}
+	stateData, _ := json.Marshal(state)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/state.json"), stateData, 0o644)
+
+	var out bytes.Buffer
+	code, err := runUnify([]string{"--task-id", "state-task"}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; output: %s", code, out.String())
+	}
+}
+
+func TestRunUnify_ArtifactWritten(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "art-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/art-task.done"), nil, 0o644)
+
+	var out bytes.Buffer
+	code, err := runUnify([]string{"--task-id", "art-task"}, &out)
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected error: code=%d err=%v", code, err)
+	}
+
+	artifactPath := filepath.Join(tmpDir, ".kiln/unify/art-task.md")
+	data, readErr := os.ReadFile(artifactPath)
+	if readErr != nil {
+		t.Fatalf("closure artifact not found: %v", readErr)
+	}
+	if !strings.Contains(string(data), "What Changed") {
+		t.Errorf("artifact missing 'What Changed' section, got: %s", string(data))
+	}
+}
+
+func TestRunUnify_DirectoryCreated(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "dir-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/dir-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "dir-task"}, &bytes.Buffer{})
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected error: code=%d err=%v", code, err)
+	}
+
+	info, statErr := os.Stat(filepath.Join(tmpDir, ".kiln/unify"))
+	if statErr != nil || !info.IsDir() {
+		t.Fatal(".kiln/unify directory was not created")
+	}
+}
+
+func TestRunUnify_OverwriteArtifact(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "ow-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/ow-task.done"), nil, 0o644)
+
+	// Run twice — second run should overwrite.
+	for i := 0; i < 2; i++ {
+		code, err := runUnify([]string{"--task-id", "ow-task"}, &bytes.Buffer{})
+		if err != nil || code != 0 {
+			t.Fatalf("run %d unexpected error: code=%d err=%v", i+1, code, err)
+		}
+	}
+
+	artifactPath := filepath.Join(tmpDir, ".kiln/unify/ow-task.md")
+	if _, statErr := os.Stat(artifactPath); statErr != nil {
+		t.Fatal("artifact not found after second run")
+	}
+}
+
+func TestRunUnify_FooterNotComplete_ExitCode2(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("not_complete")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "nc-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/nc-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "nc-task"}, &bytes.Buffer{})
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d; err=%v", code, err)
+	}
+}
+
+func TestRunUnify_FooterParseFailure_ExitCode10(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("no_footer")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "nf-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/nf-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "nf-task"}, &bytes.Buffer{})
+	if code != 10 {
+		t.Fatalf("expected exit code 10, got %d; err=%v", code, err)
+	}
+	var fe *footerError
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected footerError, got: %T %v", err, err)
+	}
+}
+
+func TestRunUnify_DecisionLedger(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	t.Setenv("KILN_TEST_TASK_ID", "led-task")
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/led-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "led-task"}, &bytes.Buffer{})
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected error: code=%d err=%v", code, err)
+	}
+
+	ledgerData, readErr := os.ReadFile(filepath.Join(tmpDir, ".kiln/decisions.log"))
+	if readErr != nil {
+		t.Fatalf("decisions.log not found: %v", readErr)
+	}
+
+	var entry decisionLedgerEntry
+	if err := json.Unmarshal(bytes.TrimSpace(ledgerData), &entry); err != nil {
+		t.Fatalf("failed to parse ledger entry: %v\ndata: %s", err, ledgerData)
+	}
+	if entry.TaskID != "led-task" {
+		t.Errorf("expected task_id 'led-task', got %q", entry.TaskID)
+	}
+	if entry.Timestamp == "" {
+		t.Error("expected non-empty timestamp")
+	}
+	if entry.ArtifactPath == "" {
+		t.Error("expected non-empty artifact_path")
+	}
+	if entry.Model == "" {
+		t.Error("expected non-empty model")
+	}
+}
+
+func TestRunUnify_DecisionLedgerAppend(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("unify-success")
+
+	tmpDir := setupUnifyDir(t)
+	ledgerPath := filepath.Join(tmpDir, ".kiln/decisions.log")
+
+	for _, taskSuffix := range []string{"first", "second"} {
+		id := "app-" + taskSuffix
+		t.Setenv("KILN_TEST_TASK_ID", id)
+		os.WriteFile(filepath.Join(tmpDir, ".kiln/done/"+id+".done"), nil, 0o644)
+		code, err := runUnify([]string{"--task-id", id}, &bytes.Buffer{})
+		if err != nil || code != 0 {
+			t.Fatalf("task %s: code=%d err=%v", id, code, err)
+		}
+	}
+
+	data, _ := os.ReadFile(ledgerPath)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 ledger entries, got %d\ndata: %s", len(lines), data)
+	}
+}
+
+func TestRunUnify_ModelFlag(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	var capturedModel string
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedModel = model
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=unify-success", "KILN_TEST_TASK_ID=mod-task")
+		return cmd
+	}
+
+	tmpDir := setupUnifyDir(t)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/mod-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "mod-task", "--model", "claude-opus-4-6"}, &bytes.Buffer{})
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected error: code=%d err=%v", code, err)
+	}
+	if capturedModel != "claude-opus-4-6" {
+		t.Errorf("expected model 'claude-opus-4-6', got %q", capturedModel)
+	}
+}
+
+func TestRunUnify_TimeoutFlag(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("hang")
+
+	tmpDir := setupUnifyDir(t)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/hang-task.done"), nil, 0o644)
+
+	code, err := runUnify([]string{"--task-id", "hang-task", "--timeout", "200ms"}, &bytes.Buffer{})
+	if code != 2 {
+		t.Fatalf("expected exit code 2 on timeout, got %d; err=%v", code, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected timeout error, got: %v", err)
+	}
+}
+
+func TestRunUnify_PromptIncludesTaskContent(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+
+	var capturedPrompt string
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedPrompt = prompt
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=unify-success", "KILN_TEST_TASK_ID=pmt-task")
+		return cmd
+	}
+
+	tmpDir := setupUnifyDir(t)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/done/pmt-task.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(tmpDir, ".kiln/prompts/tasks/pmt-task.md"), []byte("# My Task Prompt\nDo the thing."), 0o644)
+
+	code, err := runUnify([]string{"--task-id", "pmt-task"}, &bytes.Buffer{})
+	if err != nil || code != 0 {
+		t.Fatalf("unexpected error: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(capturedPrompt, "My Task Prompt") {
+		t.Errorf("prompt does not include task prompt content; prompt starts with: %s", capturedPrompt[:min(200, len(capturedPrompt))])
+	}
+}
+
+func TestRunUnify_PromptIncludesClosureSections(t *testing.T) {
+	prompt := buildUnifyPrompt("my-task", "task content here", "status=complete duration_ms=1000 model=claude-sonnet-4-6 exit_code=0")
+	for _, section := range []string{"What Changed", "What's Incomplete or Deferred", "Decisions Made", "Handoff Notes", "Acceptance Criteria Coverage"} {
+		if !strings.Contains(prompt, section) {
+			t.Errorf("prompt missing section %q", section)
+		}
+	}
+}
+
+func TestRunUnify_PromptIncludesLogSummary(t *testing.T) {
+	logSummary := "status=complete duration_ms=5000 model=claude-sonnet-4-6 exit_code=0"
+	prompt := buildUnifyPrompt("my-task", "task content", logSummary)
+	if !strings.Contains(prompt, logSummary) {
+		t.Errorf("prompt does not include log summary; prompt: %s", prompt[:min(300, len(prompt))])
+	}
+}
+
+func TestRunUnify_StripFooter(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "footer on last line",
+			input:    "# Closure\n\nSome content.\n\n{\"kiln\":{\"status\":\"complete\",\"task_id\":\"t1\"}}\n",
+			expected: "# Closure\n\nSome content.",
+		},
+		{
+			name:     "no footer",
+			input:    "# Closure\n\nSome content.\n",
+			expected: "# Closure\n\nSome content.",
+		},
+		{
+			name:     "footer with trailing newline",
+			input:    "content\n{\"kiln\":{\"status\":\"complete\",\"task_id\":\"t1\"}}\n\n",
+			expected: "content",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripFooter(tc.input)
+			if got != tc.expected {
+				t.Errorf("stripFooter(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestRunUnify_ReadLogSummary_Missing(t *testing.T) {
+	got := readLogSummary("/nonexistent/path/log.json")
+	if !strings.Contains(got, "no execution log found") {
+		t.Errorf("expected 'no execution log found', got: %s", got)
+	}
+}
+
+func TestRunUnify_ReadLogSummary_Valid(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "task.json")
+	entry := execRunLog{
+		TaskID:     "my-task",
+		Status:     "complete",
+		DurationMs: 1234,
+		Model:      "claude-sonnet-4-6",
+		ExitCode:   0,
+	}
+	data, _ := json.Marshal(entry)
+	os.WriteFile(logPath, data, 0o644)
+
+	got := readLogSummary(logPath)
+	if !strings.Contains(got, "complete") || !strings.Contains(got, "1234") {
+		t.Errorf("unexpected log summary: %s", got)
+	}
+}
+
+func TestRunGenMake_CreatesUnifyDir(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, ".kiln/targets.mk")
+	os.WriteFile(tasksPath, []byte("- id: hello\n  prompt: hello.md\n"), 0o644)
+
+	if err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
+		t.Fatalf("runGenMake failed: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(tmp, ".kiln/unify"))
+	if err != nil {
+		t.Fatalf(".kiln/unify directory not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal(".kiln/unify is not a directory")
+	}
+}
+
+func TestRun_UnifyMissingTaskID(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"unify"}, &bytes.Buffer{}, &stderr)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing --task-id")
+	}
+	if !strings.Contains(stderr.String(), "--task-id is required") {
+		t.Fatalf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+// min returns the smaller of two ints.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// --- Tests for kiln status (enhanced: log derivation, JSON format, summary) ---
+
+func TestRunStatus_PendingStatusFromNoLogNoDone(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "pending") {
+		t.Errorf("expected 'pending' status for task with no log/done, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_CompleteFromDoneMarker(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	doneDir := filepath.Join(tmpDir, ".kiln", "done")
+	os.MkdirAll(doneDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "my-task.done"), nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "complete") {
+		t.Errorf("expected 'complete' status from done marker, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_DerivedFromLogFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	// Create a log file indicating the task failed.
+	logDir := filepath.Join(tmpDir, ".kiln", "logs")
+	os.MkdirAll(logDir, 0o755)
+	logEntry := execRunLog{TaskID: "my-task", Status: "error", ExitCode: 1, ErrorClass: "claude_exit"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "my-task.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "failed") {
+		t.Errorf("expected 'failed' status derived from log error, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_NotCompleteFromLogFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	logDir := filepath.Join(tmpDir, ".kiln", "logs")
+	os.MkdirAll(logDir, 0o755)
+	logEntry := execRunLog{TaskID: "my-task", Status: "not_complete"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "my-task.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "not_complete") {
+		t.Errorf("expected 'not_complete' status from log, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_StateJSONTakesPriority(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+
+	// State says "failed" but done marker also exists — state should win.
+	stateData := `{"tasks":{"my-task":{"status":"failed","attempts":3,"last_error":"some error"}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+	doneDir := filepath.Join(kilnDir, "done")
+	os.MkdirAll(doneDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "my-task.done"), nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "failed") {
+		t.Errorf("expected state.json status 'failed' to take priority over done marker, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_AttemptCountFromLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	logDir := filepath.Join(tmpDir, ".kiln", "logs")
+	os.MkdirAll(logDir, 0o755)
+	logEntry := execRunLog{TaskID: "my-task", Status: "error"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "my-task.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	// Attempt count should be 1 (one log file = one attempt).
+	if !strings.Contains(out, "1") {
+		t.Errorf("expected attempt count 1 when log file exists, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_MissingLogsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n  needs: []\n"), 0o644)
+	// Do NOT create .kiln/logs directory.
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("should handle missing logs dir gracefully, got error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "my-task") {
+		t.Errorf("expected task in output, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_FormatJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: alpha
+  prompt: a.md
+  needs: []
+- id: beta
+  prompt: b.md
+  needs:
+    - alpha
+`), 0o644)
+
+	doneDir := filepath.Join(tmpDir, ".kiln", "done")
+	os.MkdirAll(doneDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "alpha.done"), nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath, "--format", "json"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := stdout.String()
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &result); err != nil {
+		t.Fatalf("expected valid JSON output, got parse error: %v\noutput: %s", err, out)
+	}
+	if _, ok := result["tasks"]; !ok {
+		t.Errorf("expected 'tasks' field in JSON output, got: %s", out)
+	}
+	if _, ok := result["summary"]; !ok {
+		t.Errorf("expected 'summary' field in JSON output, got: %s", out)
+	}
+}
+
+func TestRunStatus_SummaryLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Total:") {
+		t.Errorf("expected 'Total:' in summary line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Complete:") {
+		t.Errorf("expected 'Complete:' in summary line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Pending:") {
+		t.Errorf("expected 'Pending:' in summary line, got:\n%s", out)
+	}
+}
+
+func TestRunStatus_JSONSummaryCounts(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: a
+  prompt: a.md
+  needs: []
+- id: b
+  prompt: b.md
+  needs: []
+- id: c
+  prompt: c.md
+  needs: []
+`), 0o644)
+
+	// a: complete (done marker), b: failed (log), c: pending (nothing)
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	doneDir := filepath.Join(kilnDir, "done")
+	logDir := filepath.Join(kilnDir, "logs")
+	os.MkdirAll(doneDir, 0o755)
+	os.MkdirAll(logDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "a.done"), nil, 0o644)
+	logEntry := execRunLog{TaskID: "b", Status: "error"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "b.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runStatus([]string{"--tasks", tasksPath, "--format", "json"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result struct {
+		Summary struct {
+			Total    int `json:"total"`
+			Complete int `json:"complete"`
+			Failed   int `json:"failed"`
+			Pending  int `json:"pending"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+	if result.Summary.Total != 3 {
+		t.Errorf("expected total=3, got %d", result.Summary.Total)
+	}
+	if result.Summary.Complete != 1 {
+		t.Errorf("expected complete=1, got %d", result.Summary.Complete)
+	}
+	if result.Summary.Failed != 1 {
+		t.Errorf("expected failed=1, got %d", result.Summary.Failed)
+	}
+	if result.Summary.Pending != 1 {
+		t.Errorf("expected pending=1, got %d", result.Summary.Pending)
+	}
+}
+
+// --- Tests for kiln retry ---
+
+func TestRunRetry_NoTasksMatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+	// No state, no log, no done → "pending"; pending tasks are skipped.
+
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "No tasks match retry criteria.") {
+		t.Errorf("expected no-match message, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunRetry_NoMatchWhenAllComplete(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	doneDir := filepath.Join(tmpDir, ".kiln", "done")
+	os.MkdirAll(doneDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "t1.done"), nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "No tasks match retry criteria.") {
+		t.Errorf("expected no-match message for complete tasks, got:\n%s", stdout.String())
+	}
+}
+
+func TestRunRetry_PrintsTasksBeforeExecuting(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("success")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("prompt content"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	// Create a log file so t1 has "failed" status.
+	logDir := filepath.Join(tmpDir, ".kiln", "logs")
+	os.MkdirAll(logDir, 0o755)
+	logEntry := execRunLog{TaskID: "t1", Status: "error"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "t1.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Retrying 1 task(s): t1") {
+		t.Errorf("expected retrying message, got:\n%s", out)
+	}
+}
+
+func TestRunRetry_RemovesDoneMarker(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("success")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("prompt"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	// Set up: t1 has state "failed" AND a done marker.
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	doneDir := filepath.Join(kilnDir, "done")
+	os.MkdirAll(doneDir, 0o755)
+	donePath := filepath.Join(doneDir, "t1.done")
+	os.WriteFile(donePath, nil, 0o644)
+
+	stateData := `{"tasks":{"t1":{"status":"failed","attempts":1,"last_error":"timeout"}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Done marker should have been removed before exec.
+	// (exec with "success" mode will recreate it; but it was removed first)
+	out := stdout.String()
+	if !strings.Contains(out, "t1") {
+		t.Errorf("expected t1 in output, got:\n%s", out)
+	}
+}
+
+func TestRunRetry_SpecificTaskID(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("success")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("prompt"), 0o644)
+	os.WriteFile(tasksPath, []byte(`- id: t1
+  prompt: p.md
+  needs: []
+- id: t2
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	// Both tasks are failed.
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"t1":{"status":"failed","attempts":1},"t2":{"status":"failed","attempts":1}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "t1") {
+		t.Errorf("expected t1 in retry output, got:\n%s", out)
+	}
+	if strings.Contains(out, "t2") {
+		t.Errorf("expected t2 NOT in retry output (only t1 requested), got:\n%s", out)
+	}
+}
+
+func TestRunRetry_FailedFilter(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: t1
+  prompt: p.md
+  needs: []
+- id: t2
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	// t1 is "failed", t2 is "not_complete" (via log).
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	logDir := filepath.Join(kilnDir, "logs")
+	os.MkdirAll(logDir, 0o755)
+	e1 := execRunLog{TaskID: "t1", Status: "error"}
+	e2 := execRunLog{TaskID: "t2", Status: "not_complete"}
+	d1, _ := json.Marshal(e1)
+	d2, _ := json.Marshal(e2)
+	os.WriteFile(filepath.Join(logDir, "t1.json"), d1, 0o644)
+	os.WriteFile(filepath.Join(logDir, "t2.json"), d2, 0o644)
+
+	// With --failed, only t1 should be retried.
+	var stdout bytes.Buffer
+	err := runRetry([]string{"--tasks", tasksPath, "--failed"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	// t2 (not_complete) should not be in the "Retrying" line.
+	if strings.Contains(out, "Retrying") && strings.Contains(out, "t2") {
+		t.Errorf("expected t2 NOT retried with --failed filter, got:\n%s", out)
+	}
+}
+
+// --- Tests for kiln reset ---
+
+func TestRunReset_MissingFlags(t *testing.T) {
+	tmpDir := t.TempDir()
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	err := runReset([]string{"--tasks", tasksPath}, strings.NewReader(""), &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected error when neither --task-id nor --all is given")
+	}
+}
+
+func TestRunReset_UnknownTaskID(t *testing.T) {
+	tmpDir := t.TempDir()
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout bytes.Buffer
+	err := runReset([]string{"--tasks", tasksPath, "--task-id", "no-such-task"}, strings.NewReader(""), &stdout)
+	if err == nil {
+		t.Fatal("expected error for unknown task ID")
+	}
+	if !strings.Contains(err.Error(), "unknown task") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Unknown task: no-such-task") {
+		t.Errorf("expected 'Unknown task:' in output, got: %s", stdout.String())
+	}
+}
+
+func TestRunReset_RemovesDoneMarkerAndArchivesLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	doneDir := filepath.Join(kilnDir, "done")
+	logDir := filepath.Join(kilnDir, "logs")
+	os.MkdirAll(doneDir, 0o755)
+	os.MkdirAll(logDir, 0o755)
+
+	donePath := filepath.Join(doneDir, "t1.done")
+	logPath := filepath.Join(logDir, "t1.json")
+	os.WriteFile(donePath, nil, 0o644)
+	os.WriteFile(logPath, []byte(`{"task_id":"t1","status":"complete"}`), 0o644)
+
+	var stdout bytes.Buffer
+	err := runReset([]string{"--tasks", tasksPath, "--task-id", "t1"}, strings.NewReader(""), &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Done marker should be removed.
+	if _, statErr := os.Stat(donePath); !os.IsNotExist(statErr) {
+		t.Error("expected done marker to be removed after reset")
+	}
+	// Log file should be archived.
+	if _, statErr := os.Stat(logPath); !os.IsNotExist(statErr) {
+		t.Error("expected log file to be removed after reset")
+	}
+	bakPath := logPath + ".bak"
+	if _, statErr := os.Stat(bakPath); os.IsNotExist(statErr) {
+		t.Error("expected log file backup (.bak) to exist after reset")
+	}
+	// Confirmation message.
+	if !strings.Contains(stdout.String(), "Reset task: t1") {
+		t.Errorf("expected confirmation message, got: %s", stdout.String())
+	}
+}
+
+func TestRunReset_AllTasksConfirmed(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(`- id: t1
+  prompt: p.md
+  needs: []
+- id: t2
+  prompt: p.md
+  needs: []
+`), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	doneDir := filepath.Join(kilnDir, "done")
+	os.MkdirAll(doneDir, 0o755)
+	os.WriteFile(filepath.Join(doneDir, "t1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(doneDir, "t2.done"), nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runReset([]string{"--tasks", tasksPath, "--all"}, strings.NewReader("y\n"), &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Both done markers should be removed.
+	if _, statErr := os.Stat(filepath.Join(doneDir, "t1.done")); !os.IsNotExist(statErr) {
+		t.Error("expected t1.done to be removed")
+	}
+	if _, statErr := os.Stat(filepath.Join(doneDir, "t2.done")); !os.IsNotExist(statErr) {
+		t.Error("expected t2.done to be removed")
+	}
+}
+
+func TestRunReset_AllTasksAborted(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	doneDir := filepath.Join(kilnDir, "done")
+	os.MkdirAll(doneDir, 0o755)
+	donePath := filepath.Join(doneDir, "t1.done")
+	os.WriteFile(donePath, nil, 0o644)
+
+	var stdout bytes.Buffer
+	err := runReset([]string{"--tasks", tasksPath, "--all"}, strings.NewReader("n\n"), &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Done marker should NOT be removed (user said no).
+	if _, statErr := os.Stat(donePath); os.IsNotExist(statErr) {
+		t.Error("expected done marker to still exist after aborted reset")
+	}
+	if !strings.Contains(stdout.String(), "Aborted") {
+		t.Errorf("expected 'Aborted' message, got: %s", stdout.String())
+	}
+}
+
+func TestRunReset_ClearsStateJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"t1":{"status":"failed","attempts":2}}}`
+	stateFile := filepath.Join(kilnDir, "state.json")
+	os.WriteFile(stateFile, []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runReset([]string{"--tasks", tasksPath, "--task-id", "t1"}, strings.NewReader(""), &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// State entry for t1 should be removed.
+	state, _ := loadState(stateFile)
+	if state != nil && state.Tasks["t1"] != nil {
+		t.Error("expected t1 state entry to be cleared after reset")
+	}
+}
+
+// --- Tests for kiln resume ---
+
+func TestRunResume_MissingTaskID(t *testing.T) {
+	err := runResume([]string{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected error for missing --task-id")
+	}
+	if !strings.Contains(err.Error(), "--task-id is required") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRunResume_UnknownTaskID(t *testing.T) {
+	tmpDir := t.TempDir()
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "no-such"}, &stdout)
+	if err == nil {
+		t.Fatal("expected error for unknown task ID")
+	}
+	if !strings.Contains(err.Error(), "unknown task") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRunResume_NoPriorAttempts(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+	// No state, no log file.
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "No prior attempts found for task: t1") {
+		t.Errorf("expected no-prior-attempts message, got:\n%s", out)
+	}
+}
+
+func TestRunResume_OutputsResumeContext(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("# Do the thing\n\nPlease do it.\n"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"t1":{"status":"failed","attempts":2,"last_error":"timeout after 15m"}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "RESUME CONTEXT") {
+		t.Errorf("expected RESUME CONTEXT header, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Prior attempts: 2") {
+		t.Errorf("expected attempt count in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Do the thing") {
+		t.Errorf("expected original prompt content in output, got:\n%s", out)
+	}
+}
+
+func TestRunResume_IncludesClosureArtifact(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("# Task prompt\n"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(filepath.Join(kilnDir, "unify"), 0o755)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "t1.md"), []byte("Closure: auth module partially done.\n"), 0o644)
+
+	// Set up prior attempt in state.
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"t1":{"status":"not_complete","attempts":1}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "PREVIOUS CLOSURE SUMMARY") {
+		t.Errorf("expected closure section in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "Closure: auth module partially done.") {
+		t.Errorf("expected closure content in output, got:\n%s", out)
+	}
+}
+
+func TestRunResume_WorksWithoutClosureArtifact(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("# Task prompt\n"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+	stateData := `{"tasks":{"t1":{"status":"failed","attempts":1}}}`
+	os.WriteFile(filepath.Join(kilnDir, "state.json"), []byte(stateData), 0o644)
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("expected no error when no closure artifact exists: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "RESUME CONTEXT") {
+		t.Errorf("expected RESUME CONTEXT header, got:\n%s", out)
+	}
+	if strings.Contains(out, "PREVIOUS CLOSURE SUMMARY") {
+		t.Errorf("expected NO closure section when no artifact, got:\n%s", out)
+	}
+}
+
+func TestRunResume_FromLogFileWhenNoState(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	promptPath := filepath.Join(tmpDir, "p.md")
+	os.WriteFile(promptPath, []byte("# Task\n"), 0o644)
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	// No state.json, but log file exists.
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	logDir := filepath.Join(kilnDir, "logs")
+	os.MkdirAll(logDir, 0o755)
+	logEntry := execRunLog{TaskID: "t1", Status: "error", ErrorMessage: "claude exited with code 1"}
+	data, _ := json.Marshal(logEntry)
+	os.WriteFile(filepath.Join(logDir, "t1.json"), data, 0o644)
+
+	var stdout bytes.Buffer
+	err := runResume([]string{"--tasks", tasksPath, "--task-id", "t1"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "RESUME CONTEXT") {
+		t.Errorf("expected RESUME CONTEXT when falling back to log file, got:\n%s", out)
+	}
+}
+
+// --- Tests for kiln dispatch (retry/reset/resume) ---
+
+func TestRun_RetryDispatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"retry", "--tasks", tasksPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s", code, stderr.String())
+	}
+}
+
+func TestRun_ResetDispatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"reset", "--tasks", tasksPath, "--task-id", "t1"}, &stdout, &stderr)
+	// t1 exists in tasks.yaml, reset should succeed.
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d; stderr: %s; stdout: %s", code, stderr.String(), stdout.String())
+	}
+}
+
+func TestRun_ResumeDispatch_NoTaskID(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"resume"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing --task-id")
 	}
 }
