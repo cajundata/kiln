@@ -1,12 +1,12 @@
 .PHONY: all
-all: .kiln/done/unify-closure.done .kiln/done/error-taxonomy.done .kiln/done/recovery-ux.done
+all: .kiln/done/validation-hooks.done .kiln/done/verify-plan.done .kiln/done/prompt-chaining.done
 
-.kiln/done/unify-closure.done: .kiln/done/state-resumability.done
-	$(KILN) exec --task-id unify-closure
+.kiln/done/validation-hooks.done: .kiln/done/richer-schema.done
+	$(KILN) exec --task-id validation-hooks --timeout 90m
 
-.kiln/done/error-taxonomy.done: .kiln/done/state-resumability.done
-	$(KILN) exec --task-id error-taxonomy
+.kiln/done/verify-plan.done: .kiln/done/richer-schema.done .kiln/done/validation-hooks.done
+	$(KILN) exec --task-id verify-plan --timeout 90m
 
-.kiln/done/recovery-ux.done: .kiln/done/state-resumability.done
-	$(KILN) exec --task-id recovery-ux
+.kiln/done/prompt-chaining.done: .kiln/done/unify-closure.done .kiln/done/richer-schema.done
+	$(KILN) exec --task-id prompt-chaining
 

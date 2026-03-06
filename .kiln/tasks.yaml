@@ -48,6 +48,7 @@
 
 - id: validation-hooks
   prompt: .kiln/prompts/tasks/validation-hooks.md
+  timeout: 90m
   dev-phase: 3
   needs:
     - richer-schema
@@ -65,6 +66,7 @@
 
 - id: verify-plan
   prompt: .kiln/prompts/tasks/verify-plan.md
+  timeout: 90m
   dev-phase: 3
   needs:
     - richer-schema

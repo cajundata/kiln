@@ -177,6 +177,23 @@ type logEvent struct {
 	Line string    `json:"line"`
 }
 
+// gateResult holds the outcome of a single verify gate execution.
+type gateResult struct {
+	Name       string `json:"name"`
+	Cmd        string `json:"cmd"`
+	Passed     bool   `json:"passed"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMs int64  `json:"duration_ms"`
+	Stderr     string `json:"stderr,omitempty"` // combined stdout+stderr, truncated to 2000 chars
+}
+
+// verifyResults holds the aggregate outcome of all verify gates for a task run.
+type verifyResults struct {
+	Gates     []gateResult `json:"gates"`
+	AllPassed bool         `json:"all_passed"`
+	Skipped   bool         `json:"skipped"` // true when --skip-verify was used
+}
+
 // execRunLog is the structured JSON log written for each kiln exec attempt.
 type execRunLog struct {
 	TaskID       string              `json:"task_id"`
@@ -193,6 +210,7 @@ type execRunLog struct {
 	ErrorMessage string              `json:"error_message,omitempty"` // human-readable error description
 	Retryable    bool                `json:"retryable,omitempty"`     // whether this error is retryable
 	Events       []logEvent          `json:"events"`
+	Verify       *verifyResults      `json:"verify,omitempty"` // nil when no gates configured
 }
 
 // lineCapture is an io.Writer that forwards writes to an optional passthrough
@@ -436,20 +454,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "verify-plan":
+		code, err := runVerifyPlan(args[1:], stdout)
+		if err != nil {
+			fmt.Fprintf(stderr, "verify-plan: %v\n", err)
+		}
+		return code
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1
 	}
 }
 
+// VerifyGate is a post-completion validation gate in a task's verify list.
+// Each gate runs a shell command; the task is not marked done until all gates pass.
+type VerifyGate struct {
+	// Cmd is the shell command to run (required).
+	Cmd string `yaml:"cmd"`
+	// Name is a human-readable label for the gate (optional).
+	Name string `yaml:"name,omitempty"`
+	// Expect describes the expected outcome (optional); only "exit_code_zero" is currently supported.
+	Expect string `yaml:"expect,omitempty"`
+}
+
 // Task represents a single entry in the tasks.yaml file.
 type Task struct {
-	ID          string            `yaml:"id"`
-	Prompt      string            `yaml:"prompt"`
-	Needs       []string          `yaml:"needs"`
-	Timeout     string            `yaml:"timeout,omitempty"`
-	Model       string            `yaml:"model,omitempty"`
-	Description string            `yaml:"description,omitempty"`
+	ID          string   `yaml:"id"`
+	Prompt      string   `yaml:"prompt"`
+	Needs       []string `yaml:"needs"`
+	Timeout     string   `yaml:"timeout,omitempty"`
+	Model       string   `yaml:"model,omitempty"`
+	Description string   `yaml:"description,omitempty"`
 	// Kind classifies the task type (e.g. "feature", "fix", "research", "docs").
 	// Convention: tasks with kind "research" are expected to produce artifacts at
 	// .kiln/artifacts/research/<id>.md — this is a naming convention only and is
@@ -470,9 +505,9 @@ type Task struct {
 	// Acceptance lists acceptance criteria (Given/When/Then or bullet AC).
 	// Each entry must be non-empty.
 	Acceptance []string `yaml:"acceptance,omitempty"`
-	// Verify lists gate commands to run post-completion (e.g. "go test ./...", "go vet ./...").
-	// Each entry must be non-empty.
-	Verify []string `yaml:"verify,omitempty"`
+	// Verify lists validation gates to run post-completion before the .done marker is written.
+	// Set to [] to opt out of project-level defaults.
+	Verify []VerifyGate `yaml:"verify,omitempty"`
 	// Lane is a concurrency grouping identifier. Tasks in the same lane run serially.
 	// Must be kebab-case if present.
 	Lane string `yaml:"lane,omitempty"`
@@ -559,9 +594,12 @@ func loadTasks(path string) ([]Task, error) {
 				return nil, fmt.Errorf("task %q: acceptance[%d] must not be empty", t.ID, j)
 			}
 		}
-		for j, v := range t.Verify {
-			if v == "" {
-				return nil, fmt.Errorf("task %q: verify[%d] must not be empty", t.ID, j)
+		for j, g := range t.Verify {
+			if g.Cmd == "" {
+				return nil, fmt.Errorf("task %q: verify[%d].cmd must not be empty", t.ID, j)
+			}
+			if g.Expect != "" && g.Expect != "exit_code_zero" {
+				return nil, fmt.Errorf("task %q: verify[%d].expect %q is not supported; use exit_code_zero", t.ID, j, g.Expect)
 			}
 		}
 		if t.Lane != "" && !taskIDRegexp.MatchString(t.Lane) {
@@ -687,7 +725,7 @@ func runPlan(args []string, stdout io.Writer) error {
 	promptFile := fs.String("prompt", ".kiln/prompts/00_extract_tasks.md", "path to extraction prompt")
 	outFile := fs.String("out", ".kiln/tasks.yaml", "output path for tasks.yaml")
 	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
-	timeoutStr := fs.String("timeout", "15m", "maximum duration for the claude invocation")
+	timeoutStr := fs.String("timeout", "60m", "maximum duration for the claude invocation")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -855,7 +893,7 @@ func runGenMake(args []string) error {
 	}
 
 	// Create runtime subdirectories alongside the output file.
-	for _, subdir := range []string{"done", "logs", "locks", "unify"} {
+	for _, subdir := range []string{"done", "logs", "locks", "unify", filepath.Join("artifacts", "research")} {
 		if err := os.MkdirAll(filepath.Join(kilnDir, subdir), 0o755); err != nil {
 			return fmt.Errorf("failed to create %s directory: %w", subdir, err)
 		}
@@ -1188,7 +1226,7 @@ func runGenPrompts(args []string, stdout io.Writer) error {
 	prdFile := fs.String("prd", "PRD.md", "path to PRD file")
 	templateFile := fs.String("template", ".kiln/templates/<id>.md", "path to prompt template")
 	modelFlag := fs.String("model", "", "model override")
-	timeoutStr := fs.String("timeout", "15m", "timeout per Claude invocation")
+	timeoutStr := fs.String("timeout", "60m", "timeout per Claude invocation")
 	overwrite := fs.Bool("overwrite", false, "regenerate prompts even when file already exists")
 
 	if err := fs.Parse(args); err != nil {
@@ -1283,6 +1321,133 @@ The output file must follow the template structure exactly with:
 `, template, prd, taskID, taskID, taskID, taskID, outputPath, taskID, taskID)
 }
 
+// ProjectDefaults holds project-wide default settings applied to all tasks.
+type ProjectDefaults struct {
+	Verify []VerifyGate `yaml:"verify,omitempty"`
+}
+
+// ProjectConfig holds project-wide configuration loaded from .kiln/config.yaml.
+type ProjectConfig struct {
+	Defaults ProjectDefaults `yaml:"defaults"`
+}
+
+// loadProjectConfig reads path and returns the parsed config.
+// Returns an empty config (not an error) if the file does not exist.
+func loadProjectConfig(path string) (ProjectConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ProjectConfig{}, nil
+		}
+		return ProjectConfig{}, fmt.Errorf("failed to read config file: %w", err)
+	}
+	var cfg ProjectConfig
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&cfg); err != nil {
+		if err == io.EOF {
+			return ProjectConfig{}, nil // empty file is fine
+		}
+		return ProjectConfig{}, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	return cfg, nil
+}
+
+// mergeGates computes the final gate list by merging project defaults with task-level gates.
+// If taskLoaded is false, only project defaults are used.
+// If taskVerify is nil (no verify field in task), project defaults are used.
+// If taskVerify is empty (verify: []), project defaults are NOT used (opt-out).
+// If taskVerify has gates, they are appended to project defaults.
+func mergeGates(projectDefaults []VerifyGate, taskVerify []VerifyGate, taskLoaded bool) []VerifyGate {
+	if !taskLoaded {
+		return append([]VerifyGate{}, projectDefaults...)
+	}
+	if taskVerify == nil {
+		return append([]VerifyGate{}, projectDefaults...)
+	}
+	if len(taskVerify) == 0 {
+		return nil // explicit opt-out
+	}
+	combined := make([]VerifyGate, 0, len(projectDefaults)+len(taskVerify))
+	combined = append(combined, projectDefaults...)
+	combined = append(combined, taskVerify...)
+	return combined
+}
+
+// defaultVerifyGateTimeout is the per-gate timeout when running verify gates.
+const defaultVerifyGateTimeout = 60 * time.Minute
+
+// runVerifyGates runs gates sequentially and returns the results.
+// It stops at the first failure (fail-fast). workDir sets the working directory
+// for gate commands; empty string means the current directory.
+// gateTimeout is applied per gate.
+func runVerifyGates(gates []VerifyGate, taskID string, workDir string, gateTimeout time.Duration) ([]gateResult, error) {
+	if len(gates) == 0 {
+		return nil, nil
+	}
+	results := make([]gateResult, 0, len(gates))
+	for _, gate := range gates {
+		name := gate.Name
+		if name == "" {
+			name = gate.Cmd
+		}
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), gateTimeout)
+		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", gate.Cmd)
+		if workDir != "" {
+			cmd.Dir = workDir
+		}
+		// Run in its own process group so that all children (e.g. sleep spawned by sh)
+		// are killed together when the context deadline is exceeded.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			if cmd.Process != nil {
+				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			return nil
+		}
+		var combinedOut bytes.Buffer
+		cmd.Stdout = &combinedOut
+		cmd.Stderr = &combinedOut
+		runErr := cmd.Run()
+		cancel()
+		durMs := time.Since(start).Milliseconds()
+
+		exitCode := 0
+		if runErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+
+		output := combinedOut.String()
+		if len(output) > 2000 {
+			output = output[:2000]
+		}
+
+		passed := runErr == nil
+		results = append(results, gateResult{
+			Name:       name,
+			Cmd:        gate.Cmd,
+			Passed:     passed,
+			ExitCode:   exitCode,
+			DurationMs: durMs,
+			Stderr:     output,
+		})
+
+		if !passed {
+			reason := runErr.Error()
+			if ctx.Err() == context.DeadlineExceeded {
+				reason = fmt.Sprintf("timed out after %s", gateTimeout)
+			}
+			return results, fmt.Errorf("verify gate %q failed: %s", name, reason)
+		}
+	}
+	return results, nil
+}
+
 // maxBackoffDuration is the upper cap for exponential backoff delays.
 const maxBackoffDuration = 5 * time.Minute
 
@@ -1317,11 +1482,14 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	promptFile := fs.String("prompt-file", "", "path to prompt file")
 	tasksFlag := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml (resolves prompt and model from task definition)")
 	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
-	timeoutStr := fs.String("timeout", "15m", "maximum duration for the claude invocation")
+	timeoutStr := fs.String("timeout", "60m", "maximum duration for the claude invocation")
 	retriesFlag := fs.Int("retries", 0, "number of additional attempts on retryable failures")
 	retryBackoffStr := fs.String("retry-backoff", "0s", "sleep duration between retry attempts")
 	backoffFlag := fs.String("backoff", "fixed", "backoff strategy between retries: fixed or exponential")
 	forceUnlock := fs.Bool("force-unlock", false, "remove existing lock file before acquiring (for stale locks)")
+	skipVerify := fs.Bool("skip-verify", false, "skip all verify gates (useful for debugging; logs a warning)")
+	noChain := fs.Bool("no-chain", false, "disable prompt chaining (skip dependency context injection)")
+	maxContextBytes := fs.Int("max-context-bytes", 50000, "maximum bytes of injected dependency context (~50KB default)")
 
 	if err := fs.Parse(args); err != nil {
 		return 0, err
@@ -1374,6 +1542,9 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	var taskModel string
 	var taskRetries int
 	var taskEnv map[string]string
+	var taskNeeds []string
+	var taskVerify []VerifyGate // nil = not set in tasks.yaml; []VerifyGate{} = explicitly empty (opt-out)
+	var taskVerifyLoaded bool   // true if the task definition was loaded from tasks.yaml
 	if tasksExplicit || *promptFile == "" {
 		tasks, err := loadTasks(*tasksFlag)
 		if err != nil {
@@ -1392,6 +1563,9 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		taskModel = found.Model
 		taskRetries = found.Retries
 		taskEnv = found.Env
+		taskNeeds = found.Needs
+		taskVerify = found.Verify
+		taskVerifyLoaded = true
 		if *promptFile == "" {
 			if found.Prompt == "" {
 				return 0, fmt.Errorf("task %q has no prompt field", *taskID)
@@ -1423,6 +1597,18 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		return 0, fmt.Errorf("failed to read prompt file: %w", err)
 	}
 	prompt := string(data)
+
+	// Augment prompt with context from completed dependency tasks (prompt chaining).
+	if !*noChain && len(taskNeeds) > 0 {
+		kilnDir := filepath.Dir(*tasksFlag)
+		prompt = augmentPromptWithDeps(prompt, taskNeeds, *maxContextBytes, kilnDir)
+	}
+
+	// Load project-wide config (best-effort; ignore errors and proceed with no defaults).
+	projectCfg, cfgErr := loadProjectConfig(".kiln/config.yaml")
+	if cfgErr != nil {
+		fmt.Fprintf(stdout, "warning: failed to load .kiln/config.yaml: %v\n", cfgErr)
+	}
 
 	model := resolveModel(*modelFlag, taskModel)
 	retries := *retriesFlag
@@ -1458,14 +1644,41 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 
 		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, stdout, taskEnv)
 
-		// Always write the log, even on error.
+		// For successful completions, run verify gates before writing the log.
+		if err == nil && log.FooterValid {
+			finalGates := mergeGates(projectCfg.Defaults.Verify, taskVerify, taskVerifyLoaded)
+			if *skipVerify && len(finalGates) > 0 {
+				fmt.Fprintf(stdout, "warning: --skip-verify is set; skipping %d verify gate(s) for task %s\n", len(finalGates), *taskID)
+				log.Verify = &verifyResults{Skipped: true, AllPassed: true, Gates: nil}
+			} else if len(finalGates) > 0 {
+				gateRes, gateErr := runVerifyGates(finalGates, *taskID, "", defaultVerifyGateTimeout)
+				allPassed := gateErr == nil
+				log.Verify = &verifyResults{Gates: gateRes, AllPassed: allPassed, Skipped: false}
+				if !allPassed {
+					fmt.Fprintf(stdout, "verify: gate failure for task %s: %v\n", *taskID, gateErr)
+				}
+			}
+		}
+
+		// Always write the log, even on error (now includes verify results for successes).
 		if writeErr := writeExecLog(logDir, *taskID, log); writeErr != nil {
 			fmt.Fprintf(stdout, "warning: failed to write exec log: %v\n", writeErr)
 		}
 
 		if err == nil {
 			if log.FooterValid {
-				// Task completed successfully.
+				verifyPassed := log.Verify == nil || log.Verify.AllPassed || log.Verify.Skipped
+				if !verifyPassed {
+					// Verify gate failed: don't write .done marker; treat as not_complete.
+					ts.Status = "not_complete"
+					ts.DurationMs = log.DurationMs
+					ts.Model = log.Model
+					if saveErr := saveState(stateFile, state); saveErr != nil {
+						fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+					}
+					return 2, nil
+				}
+				// Task completed and all verify gates passed (or no gates, or skipped).
 				ts.Status = "completed"
 				ts.CompletedAt = log.EndedAt
 				ts.DurationMs = log.DurationMs
@@ -1759,7 +1972,7 @@ func runUnify(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("unify", flag.ContinueOnError)
 	taskID := fs.String("task-id", "", "task identifier (kebab-case)")
 	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
-	timeoutStr := fs.String("timeout", "10m", "maximum duration for the claude invocation")
+	timeoutStr := fs.String("timeout", "60m", "maximum duration for the claude invocation")
 
 	if err := fs.Parse(args); err != nil {
 		return 1, err
@@ -2266,6 +2479,121 @@ func clearAllState() {
 	}
 }
 
+// --- prompt chaining ---
+
+// truncationNotice is appended to context sections that have been truncated due to budget limits.
+const truncationNotice = "\n[truncated — exceeded context budget]\n"
+
+// depContext holds gathered context for a single dependency task.
+type depContext struct {
+	id      string
+	source  string // "unify", "research", or "log"
+	content string
+}
+
+// summarizeExecLog parses an execRunLog JSON blob and returns a minimal summary.
+// It omits raw event lines to avoid polluting downstream prompts.
+func summarizeExecLog(data []byte) string {
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return "(failed to parse execution log)"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "task_id: %s\n", entry.TaskID)
+	fmt.Fprintf(&sb, "status: %s\n", entry.Status)
+	fmt.Fprintf(&sb, "model: %s\n", entry.Model)
+	fmt.Fprintf(&sb, "duration_ms: %d\n", entry.DurationMs)
+	if entry.Footer != nil && entry.Footer.Kiln.Notes != "" {
+		fmt.Fprintf(&sb, "notes: %s\n", entry.Footer.Kiln.Notes)
+	}
+	return sb.String()
+}
+
+// augmentPromptWithDeps gathers context from completed dependency tasks and prepends
+// a "## Context from Completed Dependencies" section to the original prompt.
+// Context sources are checked in priority order: UNIFY artifact > research artifact > execution log.
+// Only dependencies with a .done marker are included.
+// If no context is available, the original prompt is returned unchanged.
+func augmentPromptWithDeps(prompt string, depIDs []string, maxContextBytes int, kilnDir string) string {
+	if len(depIDs) == 0 {
+		return prompt
+	}
+
+	var contexts []depContext
+	for _, depID := range depIDs {
+		// Only gather context from confirmed-complete deps (done marker must exist).
+		donePath := filepath.Join(kilnDir, "done", depID+".done")
+		if _, err := os.Stat(donePath); err != nil {
+			continue
+		}
+
+		// Priority 1: UNIFY closure artifact.
+		unifyPath := filepath.Join(kilnDir, "unify", depID+".md")
+		if data, err := os.ReadFile(unifyPath); err == nil {
+			contexts = append(contexts, depContext{id: depID, source: "unify", content: string(data)})
+			continue
+		}
+
+		// Priority 2: Research artifact.
+		researchPath := filepath.Join(kilnDir, "artifacts", "research", depID+".md")
+		if data, err := os.ReadFile(researchPath); err == nil {
+			contexts = append(contexts, depContext{id: depID, source: "research", content: string(data)})
+			continue
+		}
+
+		// Priority 3: Execution log (fallback).
+		logPath := filepath.Join(kilnDir, "logs", depID+".json")
+		if data, err := os.ReadFile(logPath); err == nil {
+			summary := summarizeExecLog(data)
+			contexts = append(contexts, depContext{id: depID, source: "log", content: summary})
+			continue
+		}
+	}
+
+	if len(contexts) == 0 {
+		return prompt
+	}
+
+	// Apply size guard: truncate oldest (first-listed) contexts to fit within budget.
+	if maxContextBytes > 0 {
+		total := 0
+		for _, c := range contexts {
+			total += len(c.content)
+		}
+		if total > maxContextBytes {
+			excess := total - maxContextBytes
+			for i := range contexts {
+				if excess <= 0 {
+					break
+				}
+				contentLen := len(contexts[i].content)
+				if contentLen <= excess {
+					excess -= contentLen
+					contexts[i].content = truncationNotice
+				} else {
+					keepLen := contentLen - excess
+					contexts[i].content = contexts[i].content[:keepLen] + truncationNotice
+					excess = 0
+				}
+			}
+		}
+	}
+
+	// Build augmented prompt.
+	var sb strings.Builder
+	sb.WriteString("## Context from Completed Dependencies\n\n")
+	for _, c := range contexts {
+		fmt.Fprintf(&sb, "### Dependency: %s (source: %s)\n", c.id, c.source)
+		sb.WriteString(c.content)
+		if !strings.HasSuffix(c.content, "\n") {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(prompt)
+	return sb.String()
+}
+
 // --- kiln resume ---
 
 func runResume(args []string, stdout io.Writer) error {
@@ -2364,4 +2692,187 @@ func runResume(args []string, stdout io.Writer) error {
 
 	fmt.Fprint(stdout, buf.String())
 	return nil
+}
+
+// =============================================================================
+// --- verify-plan subcommand ---
+// =============================================================================
+
+// verifyIssue represents a single coverage or executability issue found by verify-plan.
+type verifyIssue struct {
+	TaskID  string `json:"task_id"`
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+// verifyPlanSummary holds aggregate counts for the verify-plan report.
+type verifyPlanSummary struct {
+	TotalTasks int `json:"total_tasks"`
+	Covered    int `json:"covered"`
+	Uncovered  int `json:"uncovered"`
+	Warnings   int `json:"warnings"`
+}
+
+// verifyPlanResult is the full JSON-serializable report produced by verify-plan.
+type verifyPlanResult struct {
+	Summary verifyPlanSummary `json:"summary"`
+	Issues  []verifyIssue     `json:"issues"`
+	Pass    bool              `json:"pass"`
+}
+
+// runVerifyPlan implements the verify-plan subcommand.
+// It analyzes the task graph for coverage gaps between acceptance criteria and
+// verify gates, and checks that gate executables are plausibly runnable.
+// Returns exit code and any fatal error.
+func runVerifyPlan(args []string, stdout io.Writer) (int, error) {
+	fs := flag.NewFlagSet("verify-plan", flag.ContinueOnError)
+	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
+	configFile := fs.String("config", ".kiln/config.yaml", "path to config.yaml")
+	strict := fs.Bool("strict", false, "treat warnings as errors (CI mode)")
+	format := fs.String("format", "text", "output format: text or json")
+
+	if err := fs.Parse(args); err != nil {
+		return 1, err
+	}
+
+	cfg, err := loadProjectConfig(*configFile)
+	if err != nil {
+		return 1, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	tasks, loadErr := loadTasks(*tasksFile)
+	if loadErr != nil {
+		// An empty tasks file ([] or missing entries) is not an error for verify-plan.
+		if strings.Contains(loadErr.Error(), "no tasks found") {
+			printVerifyPlanReport(stdout, *format, verifyPlanResult{
+				Summary: verifyPlanSummary{},
+				Issues:  []verifyIssue{},
+				Pass:    true,
+			}, 0)
+			return 0, nil
+		}
+		return 1, loadErr
+	}
+
+	issues := []verifyIssue{}
+	covered := 0
+	uncovered := 0
+
+	for _, t := range tasks {
+		// Compute effective gates by merging project defaults with task-level gates.
+		// t.Verify == nil means "inherit defaults"; len == 0 means explicit opt-out.
+		effectiveGates := mergeGates(cfg.Defaults.Verify, t.Verify, true)
+		hasAcceptance := len(t.Acceptance) > 0
+		hasGates := len(effectiveGates) > 0
+
+		if !hasAcceptance && !hasGates {
+			continue // neither: skip silently
+		}
+
+		if hasAcceptance && !hasGates {
+			uncovered++
+			issues = append(issues, verifyIssue{
+				TaskID:  t.ID,
+				Type:    "UNCOVERED",
+				Message: fmt.Sprintf("Task has %d acceptance criteria but no verify gates", len(t.Acceptance)),
+			})
+			continue
+		}
+
+		if !hasAcceptance && hasGates {
+			issues = append(issues, verifyIssue{
+				TaskID:  t.ID,
+				Type:    "UNANCHORED",
+				Message: "Task has verify gates but no acceptance criteria",
+			})
+		}
+
+		if hasAcceptance && hasGates {
+			covered++
+		}
+
+		// Check each gate's executability.
+		for _, gate := range effectiveGates {
+			if strings.TrimSpace(gate.Cmd) == "" {
+				issues = append(issues, verifyIssue{
+					TaskID:  t.ID,
+					Type:    "EMPTY_CMD",
+					Message: "Verify gate has empty or blank command",
+				})
+				continue
+			}
+			parts := strings.Fields(gate.Cmd)
+			if len(parts) > 0 {
+				if _, lookErr := exec.LookPath(parts[0]); lookErr != nil {
+					issues = append(issues, verifyIssue{
+						TaskID:  t.ID,
+						Type:    "CMD_NOT_FOUND",
+						Message: fmt.Sprintf("Executable %q not found on PATH", parts[0]),
+					})
+				}
+			}
+		}
+	}
+
+	// Tally errors vs warnings based on --strict flag.
+	errorCount := 0
+	warningCount := 0
+	for _, issue := range issues {
+		switch issue.Type {
+		case "UNCOVERED", "EMPTY_CMD":
+			errorCount++
+		case "UNANCHORED", "CMD_NOT_FOUND":
+			if *strict {
+				errorCount++
+			} else {
+				warningCount++
+			}
+		}
+	}
+
+	pass := errorCount == 0
+	result := verifyPlanResult{
+		Summary: verifyPlanSummary{
+			TotalTasks: len(tasks),
+			Covered:    covered,
+			Uncovered:  uncovered,
+			Warnings:   warningCount,
+		},
+		Issues: issues,
+		Pass:   pass,
+	}
+
+	printVerifyPlanReport(stdout, *format, result, errorCount)
+	if !pass {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// printVerifyPlanReport writes the verify-plan report to stdout in the requested format.
+func printVerifyPlanReport(stdout io.Writer, format string, result verifyPlanResult, errorCount int) {
+	if format == "json" {
+		data, _ := json.Marshal(result)
+		fmt.Fprintln(stdout, string(data))
+		return
+	}
+
+	// Text format.
+	s := result.Summary
+	fmt.Fprintf(stdout, "verify-plan: %d tasks | %d covered | %d uncovered | %d warnings\n",
+		s.TotalTasks, s.Covered, s.Uncovered, s.Warnings)
+
+	if len(result.Issues) > 0 {
+		fmt.Fprintln(stdout)
+		for _, issue := range result.Issues {
+			fmt.Fprintf(stdout, "[%s] %s: %s\n", issue.Type, issue.TaskID, issue.Message)
+		}
+		fmt.Fprintln(stdout)
+	}
+
+	if result.Pass {
+		fmt.Fprintln(stdout, "All tasks covered")
+	} else {
+		fmt.Fprintf(stdout, "%d issue(s) found\n", errorCount)
+	}
 }

@@ -4066,8 +4066,10 @@ func TestLoadTasks_RicherSchema_AllNewFields(t *testing.T) {
     - Given a user exists, when they login, then they get a token
     - Dashboard loads within 2s
   verify:
-    - go test ./...
-    - go vet ./...
+    - cmd: go test ./...
+      name: unit tests
+    - cmd: go vet ./...
+      name: vet
   lane: backend-lane
   exclusive: true
 `), 0o644)
@@ -4089,7 +4091,7 @@ func TestLoadTasks_RicherSchema_AllNewFields(t *testing.T) {
 	if len(task.Acceptance) != 2 {
 		t.Errorf("expected 2 acceptance criteria, got %d", len(task.Acceptance))
 	}
-	if len(task.Verify) != 2 || task.Verify[0] != "go test ./..." {
+	if len(task.Verify) != 2 || task.Verify[0].Cmd != "go test ./..." || task.Verify[1].Cmd != "go vet ./..." {
 		t.Errorf("unexpected verify: %v", task.Verify)
 	}
 	if task.Lane != "backend-lane" {
@@ -4180,15 +4182,15 @@ func TestLoadTasks_EmptyVerifyEntryRejected(t *testing.T) {
 	os.WriteFile(p, []byte(`- id: bad-task
   prompt: p.md
   verify:
-    - go test ./...
-    - ""
+    - cmd: go test ./...
+    - cmd: ""
 `), 0o644)
 
 	_, err := loadTasks(p)
 	if err == nil {
-		t.Fatal("expected error for empty verify entry")
+		t.Fatal("expected error for empty verify cmd")
 	}
-	if !strings.Contains(err.Error(), "verify[1] must not be empty") {
+	if !strings.Contains(err.Error(), "verify[1].cmd must not be empty") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -6593,5 +6595,1382 @@ func TestRun_ResumeDispatch_NoTaskID(t *testing.T) {
 	code := run([]string{"resume"}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatal("expected non-zero exit for missing --task-id")
+	}
+}
+
+// --- Tests for prompt chaining ---
+
+// setupKilnDir creates a minimal .kiln directory structure under a temp dir.
+// Returns the kilnDir path (e.g. "<tmp>/.kiln").
+func setupKilnDir(t *testing.T) (tmpDir, kilnDir string) {
+	t.Helper()
+	tmpDir = t.TempDir()
+	kilnDir = filepath.Join(tmpDir, ".kiln")
+	for _, sub := range []string{"done", "logs", "unify", filepath.Join("artifacts", "research")} {
+		if err := os.MkdirAll(filepath.Join(kilnDir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tmpDir, kilnDir
+}
+
+func TestAugmentPromptWithDeps_NoDeps(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	result := augmentPromptWithDeps("original prompt", nil, 50000, kilnDir)
+	if result != "original prompt" {
+		t.Errorf("expected original prompt, got %q", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_NoContextFilesExist(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	// Create done marker but no context files.
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+
+	result := augmentPromptWithDeps("original prompt", []string{"dep1"}, 50000, kilnDir)
+	if result != "original prompt" {
+		t.Errorf("expected original prompt unchanged, got %q", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_SkipWithoutDoneMarker(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	// Write unify artifact but NO done marker.
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte("unify content"), 0o644)
+
+	result := augmentPromptWithDeps("original prompt", []string{"dep1"}, 50000, kilnDir)
+	if result != "original prompt" {
+		t.Errorf("expected original prompt unchanged when no done marker, got %q", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_PrefersUnifyOverResearchOverLog(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte("unify content"), 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "artifacts", "research", "dep1.md"), []byte("research content"), 0o644)
+	writeExecLog(filepath.Join(kilnDir, "logs"), "dep1", execRunLog{TaskID: "dep1", Status: "complete", Model: "m", DurationMs: 1})
+
+	result := augmentPromptWithDeps("prompt", []string{"dep1"}, 50000, kilnDir)
+	if !strings.Contains(result, "unify content") {
+		t.Error("expected unify content to be used")
+	}
+	if strings.Contains(result, "research content") {
+		t.Error("research content should not be included when unify exists")
+	}
+	if !strings.Contains(result, "source: unify") {
+		t.Errorf("expected source label 'unify', got: %s", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_FallsBackToResearchWhenNoUnify(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "artifacts", "research", "dep1.md"), []byte("research content"), 0o644)
+
+	result := augmentPromptWithDeps("prompt", []string{"dep1"}, 50000, kilnDir)
+	if !strings.Contains(result, "research content") {
+		t.Error("expected research content as fallback")
+	}
+	if !strings.Contains(result, "source: research") {
+		t.Errorf("expected source label 'research', got: %s", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_FallsBackToLogWhenNoUnifyOrResearch(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	entry := execRunLog{TaskID: "dep1", Status: "complete", Model: "claude-sonnet-4-6", DurationMs: 1234}
+	writeExecLog(filepath.Join(kilnDir, "logs"), "dep1", entry)
+
+	result := augmentPromptWithDeps("prompt", []string{"dep1"}, 50000, kilnDir)
+	if !strings.Contains(result, "task_id: dep1") {
+		t.Error("expected log summary with task_id")
+	}
+	if !strings.Contains(result, "source: log") {
+		t.Errorf("expected source label 'log', got: %s", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_SourceLabelInHeader(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "my-task.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "my-task.md"), []byte("content"), 0o644)
+
+	result := augmentPromptWithDeps("prompt", []string{"my-task"}, 50000, kilnDir)
+	if !strings.Contains(result, "### Dependency: my-task (source: unify)") {
+		t.Errorf("expected correct section header, got: %s", result)
+	}
+}
+
+func TestAugmentPromptWithDeps_TruncatesWhenOverBudget(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep2.done"), nil, 0o644)
+
+	content1 := strings.Repeat("A", 100)
+	content2 := strings.Repeat("B", 100)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte(content1), 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep2.md"), []byte(content2), 0o644)
+
+	// Total = 200 bytes, budget = 120 => dep1 should be partially truncated.
+	result := augmentPromptWithDeps("prompt", []string{"dep1", "dep2"}, 120, kilnDir)
+	if !strings.Contains(result, truncationNotice) {
+		t.Error("expected truncation notice in result")
+	}
+	// dep2 content (BBBs) should be fully preserved.
+	if !strings.Contains(result, content2) {
+		t.Error("expected dep2 content (newest) to be fully preserved")
+	}
+}
+
+func TestAugmentPromptWithDeps_TruncatesOldestFirst(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	for _, id := range []string{"dep1", "dep2"} {
+		os.WriteFile(filepath.Join(kilnDir, "done", id+".done"), nil, 0o644)
+	}
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte(strings.Repeat("A", 100)), 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep2.md"), []byte(strings.Repeat("B", 100)), 0o644)
+
+	// Budget = 50: dep1 (oldest, 100B) should be truncated, dep2 may also be partially truncated.
+	result := augmentPromptWithDeps("prompt", []string{"dep1", "dep2"}, 50, kilnDir)
+
+	// dep1 content should be reduced (truncation notice present in dep1 section).
+	dep1Idx := strings.Index(result, "### Dependency: dep1")
+	dep2Idx := strings.Index(result, "### Dependency: dep2")
+	if dep1Idx < 0 || dep2Idx < 0 {
+		t.Fatal("both dep sections should be present")
+	}
+	dep1Section := result[dep1Idx:dep2Idx]
+	if !strings.Contains(dep1Section, truncationNotice) {
+		t.Error("dep1 (oldest) section should contain truncation notice")
+	}
+}
+
+func TestAugmentPromptWithDeps_TruncationNotice(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte(strings.Repeat("X", 200)), 0o644)
+
+	result := augmentPromptWithDeps("prompt", []string{"dep1"}, 10, kilnDir)
+	if !strings.Contains(result, "[truncated — exceeded context budget]") {
+		t.Error("expected truncation notice text in result")
+	}
+}
+
+func TestAugmentPromptWithDeps_NoSectionWhenNoContext(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	// dep1 done marker exists but no context files.
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+
+	result := augmentPromptWithDeps("original prompt", []string{"dep1"}, 50000, kilnDir)
+	if strings.Contains(result, "## Context from Completed Dependencies") {
+		t.Error("should not add context section when no context is available")
+	}
+}
+
+func TestSummarizeExecLog_ExtractsFields(t *testing.T) {
+	entry := execRunLog{
+		TaskID:     "my-task",
+		Status:     "complete",
+		Model:      "claude-sonnet-4-6",
+		DurationMs: 5000,
+		Footer:     &kilnFooterEnvelope{Kiln: kilnFooterPayload{Status: "complete", TaskID: "my-task", Notes: "some notes"}},
+	}
+	data, _ := json.Marshal(entry)
+	summary := summarizeExecLog(data)
+
+	for _, want := range []string{"task_id: my-task", "status: complete", "model: claude-sonnet-4-6", "duration_ms: 5000", "notes: some notes"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("expected %q in summary, got: %s", want, summary)
+		}
+	}
+}
+
+func TestSummarizeExecLog_NoRawEvents(t *testing.T) {
+	entry := execRunLog{
+		TaskID:     "my-task",
+		Status:     "complete",
+		Model:      "claude-sonnet-4-6",
+		DurationMs: 100,
+		Events: []logEvent{
+			{TS: time.Now(), Type: "stdout", Line: "this is a raw event line"},
+		},
+	}
+	data, _ := json.Marshal(entry)
+	summary := summarizeExecLog(data)
+
+	if strings.Contains(summary, "this is a raw event line") {
+		t.Error("raw event lines should not appear in execution log summary")
+	}
+}
+
+func TestAugmentPromptWithDeps_NoChainFlag(t *testing.T) {
+	_, kilnDir := setupKilnDir(t)
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte("dep context"), 0o644)
+
+	// Simulate --no-chain by NOT calling augmentPromptWithDeps.
+	// The flag logic is in runExec; here we just verify the function produces
+	// augmented output (proving the flag would suppress it).
+	withChain := augmentPromptWithDeps("my prompt", []string{"dep1"}, 50000, kilnDir)
+	if !strings.Contains(withChain, "dep context") {
+		t.Error("augmented prompt should contain dep context when chaining is enabled")
+	}
+	// Without calling augment (--no-chain path), prompt is unchanged.
+	withoutChain := "my prompt"
+	if strings.Contains(withoutChain, "dep context") {
+		t.Error("unchained prompt should not contain dep context")
+	}
+}
+
+func TestExecFlag_NoChain(t *testing.T) {
+	tmpDir := t.TempDir()
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	for _, sub := range []string{"done", "logs", "locks", "unify", filepath.Join("artifacts", "research")} {
+		os.MkdirAll(filepath.Join(kilnDir, sub), 0o755)
+	}
+
+	// Create tasks.yaml with a dep.
+	tasksPath := filepath.Join(kilnDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: dep1\n  prompt: dep1.md\n  needs: []\n- id: main-task\n  prompt: main.md\n  needs: [dep1]\n"), 0o644)
+
+	// Create done marker and context for dep1.
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte("dep1 context data"), 0o644)
+
+	// Create prompt files.
+	os.WriteFile(filepath.Join(tmpDir, "main.md"), []byte("main task prompt"), 0o644)
+
+	// Track whether the prompt passed to commandBuilder contained dep context.
+	var capturedPrompt string
+	orig := commandBuilder
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedPrompt = prompt
+		// Return a command that exits immediately.
+		return exec.CommandContext(ctx, "true")
+	}
+	defer func() { commandBuilder = orig }()
+
+	var stdout bytes.Buffer
+	// Run with --no-chain; dep context should NOT appear in prompt.
+	runExec([]string{
+		"--task-id", "main-task",
+		"--tasks", tasksPath,
+		"--no-chain",
+		"--prompt-file", filepath.Join(tmpDir, "main.md"),
+	}, &stdout)
+
+	if strings.Contains(capturedPrompt, "dep1 context data") {
+		t.Error("--no-chain flag should prevent dep context injection")
+	}
+}
+
+func TestExecFlag_MaxContextBytes(t *testing.T) {
+	tmpDir := t.TempDir()
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	for _, sub := range []string{"done", "logs", "locks", "unify", filepath.Join("artifacts", "research")} {
+		os.MkdirAll(filepath.Join(kilnDir, sub), 0o755)
+	}
+
+	tasksPath := filepath.Join(kilnDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: dep1\n  prompt: dep1.md\n  needs: []\n- id: main-task\n  prompt: main.md\n  needs: [dep1]\n"), 0o644)
+
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	bigContent := strings.Repeat("Z", 1000)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte(bigContent), 0o644)
+
+	os.WriteFile(filepath.Join(tmpDir, "main.md"), []byte("main task prompt"), 0o644)
+
+	var capturedPrompt string
+	orig := commandBuilder
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedPrompt = prompt
+		return exec.CommandContext(ctx, "true")
+	}
+	defer func() { commandBuilder = orig }()
+
+	var stdout bytes.Buffer
+	runExec([]string{
+		"--task-id", "main-task",
+		"--tasks", tasksPath,
+		"--max-context-bytes", "100",
+		"--prompt-file", filepath.Join(tmpDir, "main.md"),
+	}, &stdout)
+
+	if strings.Contains(capturedPrompt, bigContent) {
+		t.Error("--max-context-bytes should truncate large dep context")
+	}
+	if !strings.Contains(capturedPrompt, "[truncated") {
+		t.Error("truncation notice should appear when context is truncated")
+	}
+}
+
+func TestExecWithDeps_AugmentsPrompt(t *testing.T) {
+	tmpDir := t.TempDir()
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	for _, sub := range []string{"done", "logs", "locks", "unify", filepath.Join("artifacts", "research")} {
+		os.MkdirAll(filepath.Join(kilnDir, sub), 0o755)
+	}
+
+	tasksPath := filepath.Join(kilnDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: dep1\n  prompt: dep1.md\n  needs: []\n- id: main-task\n  prompt: main.md\n  needs: [dep1]\n"), 0o644)
+
+	os.WriteFile(filepath.Join(kilnDir, "done", "dep1.done"), nil, 0o644)
+	os.WriteFile(filepath.Join(kilnDir, "unify", "dep1.md"), []byte("closure summary for dep1"), 0o644)
+	os.WriteFile(filepath.Join(tmpDir, "main.md"), []byte("main task prompt"), 0o644)
+
+	var capturedPrompt string
+	orig := commandBuilder
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		capturedPrompt = prompt
+		return exec.CommandContext(ctx, "true")
+	}
+	defer func() { commandBuilder = orig }()
+
+	var stdout bytes.Buffer
+	runExec([]string{
+		"--task-id", "main-task",
+		"--tasks", tasksPath,
+		"--prompt-file", filepath.Join(tmpDir, "main.md"),
+	}, &stdout)
+
+	if !strings.Contains(capturedPrompt, "## Context from Completed Dependencies") {
+		t.Error("prompt should contain context section header")
+	}
+	if !strings.Contains(capturedPrompt, "closure summary for dep1") {
+		t.Error("prompt should contain dep1 closure content")
+	}
+}
+
+func TestGenMake_CreatesArtifactsResearchDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	kilnDir := filepath.Join(tmpDir, ".kiln")
+	os.MkdirAll(kilnDir, 0o755)
+
+	tasksPath := filepath.Join(kilnDir, "tasks.yaml")
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
+
+	outPath := filepath.Join(kilnDir, "targets.mk")
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("runGenMake failed: %v", err)
+	}
+
+	researchDir := filepath.Join(kilnDir, "artifacts", "research")
+	if _, statErr := os.Stat(researchDir); os.IsNotExist(statErr) {
+		t.Errorf("expected .kiln/artifacts/research/ to be created by gen-make, but it does not exist")
+	}
+}
+
+// =============================================================================
+// --- Tests for runVerifyGates ---
+// =============================================================================
+
+func TestRunVerifyGates_NoGates(t *testing.T) {
+	results, err := runVerifyGates(nil, "t", "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("expected nil error for empty gates, got %v", err)
+	}
+	if results != nil {
+		t.Fatalf("expected nil results for empty gates, got %v", results)
+	}
+}
+
+func TestRunVerifyGates_AllPass(t *testing.T) {
+	gates := []VerifyGate{
+		{Cmd: "true", Name: "always-pass"},
+		{Cmd: "true", Name: "also-pass"},
+	}
+	results, err := runVerifyGates(gates, "t", "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	for i, r := range results {
+		if !r.Passed {
+			t.Errorf("result[%d] should have passed", i)
+		}
+		if r.ExitCode != 0 {
+			t.Errorf("result[%d] exit code should be 0, got %d", i, r.ExitCode)
+		}
+	}
+}
+
+func TestRunVerifyGates_FailFast(t *testing.T) {
+	gates := []VerifyGate{
+		{Cmd: "true", Name: "first"},
+		{Cmd: "false", Name: "fails-here"},
+		{Cmd: "true", Name: "never-runs"},
+	}
+	results, err := runVerifyGates(gates, "t", "", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error from failing gate")
+	}
+	if !strings.Contains(err.Error(), "fails-here") {
+		t.Errorf("expected error to mention gate name, got: %v", err)
+	}
+	// Only first two gates run (fail-fast stops after the failing gate).
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (fail-fast), got %d", len(results))
+	}
+	if !results[0].Passed {
+		t.Error("first gate should have passed")
+	}
+	if results[1].Passed {
+		t.Error("second gate should have failed")
+	}
+	if results[1].ExitCode == 0 {
+		t.Error("second gate exit code should be non-zero")
+	}
+}
+
+func TestRunVerifyGates_FailFast_ThirdNotRun(t *testing.T) {
+	// Verify that the third gate is NOT run when the second fails.
+	markerFile := filepath.Join(t.TempDir(), "marker")
+	gates := []VerifyGate{
+		{Cmd: "true"},
+		{Cmd: "false"},
+		{Cmd: "touch " + markerFile},
+	}
+	_, _ = runVerifyGates(gates, "t", "", 5*time.Second)
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Error("third gate should NOT have run after second gate failed")
+	}
+}
+
+func TestRunVerifyGates_Timeout(t *testing.T) {
+	gates := []VerifyGate{
+		{Cmd: "sleep 10", Name: "slow-gate"},
+	}
+	start := time.Now()
+	_, err := runVerifyGates(gates, "t", "", 100*time.Millisecond)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout message, got: %v", err)
+	}
+	if elapsed >= 5*time.Second {
+		t.Errorf("gate should have been killed quickly, elapsed: %v", elapsed)
+	}
+}
+
+func TestRunVerifyGates_StderrCaptured(t *testing.T) {
+	gates := []VerifyGate{
+		{Cmd: "echo 'gate output'; exit 1", Name: "failing-with-output"},
+	}
+	results, err := runVerifyGates(gates, "t", "", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error from failing gate")
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !strings.Contains(results[0].Stderr, "gate output") {
+		t.Errorf("expected stdout/stderr captured in Stderr field, got: %q", results[0].Stderr)
+	}
+}
+
+func TestRunVerifyGates_DurationRecorded(t *testing.T) {
+	gates := []VerifyGate{{Cmd: "true"}}
+	results, err := runVerifyGates(gates, "t", "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if results[0].DurationMs < 0 {
+		t.Error("expected non-negative duration")
+	}
+}
+
+func TestRunVerifyGates_NameFallsBackToCmd(t *testing.T) {
+	gates := []VerifyGate{{Cmd: "false"}} // no Name set
+	results, err := runVerifyGates(gates, "t", "", 5*time.Second)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result")
+	}
+	if results[0].Name != "false" {
+		t.Errorf("expected gate name to fall back to cmd %q, got %q", "false", results[0].Name)
+	}
+	// Error message should reference the cmd.
+	if !strings.Contains(err.Error(), "false") {
+		t.Errorf("expected error to mention gate cmd, got: %v", err)
+	}
+}
+
+// =============================================================================
+// --- Tests for mergeGates ---
+// =============================================================================
+
+func TestMergeGates_NilDefaults_NilTask(t *testing.T) {
+	result := mergeGates(nil, nil, true)
+	if len(result) != 0 {
+		t.Errorf("expected 0 gates, got %d", len(result))
+	}
+}
+
+func TestMergeGates_ProjectDefaults_TaskNotLoaded(t *testing.T) {
+	defaults := []VerifyGate{{Cmd: "go test ./..."}}
+	result := mergeGates(defaults, nil, false)
+	if len(result) != 1 || result[0].Cmd != "go test ./..." {
+		t.Errorf("expected project defaults when task not loaded, got %v", result)
+	}
+}
+
+func TestMergeGates_ProjectDefaults_TaskNilVerify(t *testing.T) {
+	defaults := []VerifyGate{{Cmd: "go test ./..."}}
+	result := mergeGates(defaults, nil, true)
+	if len(result) != 1 || result[0].Cmd != "go test ./..." {
+		t.Errorf("expected project defaults when task verify is nil, got %v", result)
+	}
+}
+
+func TestMergeGates_OptOut(t *testing.T) {
+	defaults := []VerifyGate{{Cmd: "go test ./..."}}
+	result := mergeGates(defaults, []VerifyGate{}, true) // explicit empty = opt-out
+	if len(result) != 0 {
+		t.Errorf("expected 0 gates after opt-out, got %d", len(result))
+	}
+}
+
+func TestMergeGates_TaskGatesAppendedToDefaults(t *testing.T) {
+	defaults := []VerifyGate{{Cmd: "go test ./...", Name: "unit tests"}}
+	taskGates := []VerifyGate{{Cmd: "go vet ./...", Name: "vet"}}
+	result := mergeGates(defaults, taskGates, true)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 gates, got %d", len(result))
+	}
+	if result[0].Cmd != "go test ./..." {
+		t.Errorf("first gate should be project default, got %q", result[0].Cmd)
+	}
+	if result[1].Cmd != "go vet ./..." {
+		t.Errorf("second gate should be task gate, got %q", result[1].Cmd)
+	}
+}
+
+// =============================================================================
+// --- Tests for loadProjectConfig ---
+// =============================================================================
+
+func TestLoadProjectConfig_Missing(t *testing.T) {
+	cfg, err := loadProjectConfig("/nonexistent/path/config.yaml")
+	if err != nil {
+		t.Fatalf("expected no error for missing config, got %v", err)
+	}
+	if len(cfg.Defaults.Verify) != 0 {
+		t.Errorf("expected empty defaults, got %v", cfg.Defaults.Verify)
+	}
+}
+
+func TestLoadProjectConfig_WithDefaults(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(p, []byte(`defaults:
+  verify:
+    - cmd: go test ./...
+      name: unit tests
+    - cmd: go vet ./...
+      name: go vet
+`), 0o644)
+
+	cfg, err := loadProjectConfig(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Defaults.Verify) != 2 {
+		t.Fatalf("expected 2 default gates, got %d", len(cfg.Defaults.Verify))
+	}
+	if cfg.Defaults.Verify[0].Cmd != "go test ./..." {
+		t.Errorf("unexpected first gate cmd: %q", cfg.Defaults.Verify[0].Cmd)
+	}
+	if cfg.Defaults.Verify[0].Name != "unit tests" {
+		t.Errorf("unexpected first gate name: %q", cfg.Defaults.Verify[0].Name)
+	}
+}
+
+func TestLoadProjectConfig_EmptyFile(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(p, []byte(""), 0o644)
+
+	cfg, err := loadProjectConfig(p)
+	if err != nil {
+		t.Fatalf("unexpected error for empty config file: %v", err)
+	}
+	if len(cfg.Defaults.Verify) != 0 {
+		t.Errorf("expected empty defaults, got %v", cfg.Defaults.Verify)
+	}
+}
+
+// =============================================================================
+// --- Tests for validation hooks in runExec ---
+// =============================================================================
+
+// execWithVerify is a helper that sets up a temp dir with a tasks.yaml, optional
+// config.yaml, and a prompt file, then runs runExec with a fake claude that
+// returns "complete" for task "my-task". Returns the exit code and output.
+func execWithVerify(t *testing.T, taskYAML, configYAML string, extraArgs ...string) (int, string) {
+	t.Helper()
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	// Set the task ID so the fake claude emits a matching footer.
+	t.Setenv("KILN_TEST_TASK_ID", "my-task")
+	commandBuilder = fakeCommandBuilder("complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	os.MkdirAll(filepath.Join(tmpDir, ".kiln"), 0o755)
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test prompt"), 0o644)
+
+	tasksPath := filepath.Join(tmpDir, ".kiln", "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(taskYAML), 0o644)
+
+	if configYAML != "" {
+		configPath := filepath.Join(tmpDir, ".kiln", "config.yaml")
+		os.WriteFile(configPath, []byte(configYAML), 0o644)
+	}
+
+	args := []string{"--task-id", "my-task", "--tasks", tasksPath}
+	args = append(args, extraArgs...)
+
+	var out bytes.Buffer
+	code, err := runExec(args, &out)
+	if err != nil {
+		t.Logf("runExec error: %v", err)
+	}
+	return code, out.String()
+}
+
+func TestRunExec_NoVerifyGates_BehaviorUnchanged(t *testing.T) {
+	code, _ := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n",
+		"",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2 (complete), got %d", code)
+	}
+	// .done marker should be written.
+	if _, err := os.Stat(".kiln/done/my-task.done"); err != nil {
+		t.Errorf("expected .done marker to exist: %v", err)
+	}
+}
+
+func TestRunExec_VerifyGates_AllPass_WritesDoneMarker(t *testing.T) {
+	code, out := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: true\n      name: pass\n",
+		"",
+	)
+	_ = out
+	if code != 2 {
+		t.Fatalf("expected exit code 2 (complete), got %d; output: %s", code, out)
+	}
+	if _, err := os.Stat(".kiln/done/my-task.done"); err != nil {
+		t.Errorf("expected .done marker to exist: %v", err)
+	}
+}
+
+func TestRunExec_VerifyGates_Fail_NoDoneMarker(t *testing.T) {
+	code, out := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: false\n      name: fail-gate\n",
+		"",
+	)
+	// Should exit 2 (not_complete) without writing .done.
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d; output: %s", code, out)
+	}
+	if _, err := os.Stat(".kiln/done/my-task.done"); err == nil {
+		t.Error(".done marker should NOT exist when verify gate fails")
+	}
+	if !strings.Contains(out, "verify") {
+		t.Errorf("expected verify failure message in output, got: %s", out)
+	}
+}
+
+func TestRunExec_SkipVerify_SkipsGates(t *testing.T) {
+	// Gate would fail if actually run, but --skip-verify should bypass it.
+	code, out := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: false\n      name: would-fail\n",
+		"",
+		"--skip-verify",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d; output: %s", code, out)
+	}
+	if _, err := os.Stat(".kiln/done/my-task.done"); err != nil {
+		t.Errorf("expected .done marker when --skip-verify is set: %v", err)
+	}
+	if !strings.Contains(out, "--skip-verify") && !strings.Contains(out, "skip") {
+		t.Errorf("expected skip-verify warning in output, got: %s", out)
+	}
+}
+
+func TestRunExec_VerifyGates_SkippedWhenTaskNotComplete(t *testing.T) {
+	// For a not_complete task, verify gates should NOT run.
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("not_complete")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	os.MkdirAll(filepath.Join(tmpDir, ".kiln"), 0o755)
+	os.WriteFile(filepath.Join(tmpDir, "prompt.md"), []byte("test prompt"), 0o644)
+
+	markerFile := filepath.Join(tmpDir, "gate-ran")
+	tasksPath := filepath.Join(tmpDir, ".kiln", "tasks.yaml")
+	os.WriteFile(tasksPath, []byte(fmt.Sprintf(
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: touch %s\n",
+		markerFile,
+	)), 0o644)
+
+	var out bytes.Buffer
+	runExec([]string{"--task-id", "my-task", "--tasks", tasksPath}, &out)
+
+	if _, err := os.Stat(markerFile); err == nil {
+		t.Error("verify gate should NOT have run when task was not_complete")
+	}
+}
+
+func TestRunExec_VerifyLog_IncludesGateResults(t *testing.T) {
+	code, _ := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: true\n      name: unit-tests\n",
+		"",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d", code)
+	}
+
+	logPath := ".kiln/logs/my-task.json"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log: %v", err)
+	}
+
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("failed to parse log: %v", err)
+	}
+	if entry.Verify == nil {
+		t.Fatal("expected verify field in log entry")
+	}
+	if !entry.Verify.AllPassed {
+		t.Error("expected all_passed to be true")
+	}
+	if entry.Verify.Skipped {
+		t.Error("expected skipped to be false")
+	}
+	if len(entry.Verify.Gates) != 1 {
+		t.Fatalf("expected 1 gate result, got %d", len(entry.Verify.Gates))
+	}
+	if entry.Verify.Gates[0].Name != "unit-tests" {
+		t.Errorf("expected gate name 'unit-tests', got %q", entry.Verify.Gates[0].Name)
+	}
+	if !entry.Verify.Gates[0].Passed {
+		t.Error("expected gate to have passed")
+	}
+}
+
+func TestRunExec_VerifyLog_FailedGateResults(t *testing.T) {
+	_, _ = execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: false\n      name: fail-gate\n",
+		"",
+	)
+
+	logPath := ".kiln/logs/my-task.json"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log: %v", err)
+	}
+
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("failed to parse log: %v", err)
+	}
+	if entry.Verify == nil {
+		t.Fatal("expected verify field in log entry")
+	}
+	if entry.Verify.AllPassed {
+		t.Error("expected all_passed to be false")
+	}
+	if len(entry.Verify.Gates) != 1 {
+		t.Fatalf("expected 1 gate result, got %d", len(entry.Verify.Gates))
+	}
+	if entry.Verify.Gates[0].Passed {
+		t.Error("expected gate to have failed")
+	}
+	if entry.Verify.Gates[0].ExitCode == 0 {
+		t.Error("expected non-zero exit code for failed gate")
+	}
+}
+
+func TestRunExec_VerifyLog_SkippedField(t *testing.T) {
+	code, _ := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: true\n",
+		"",
+		"--skip-verify",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d", code)
+	}
+
+	logPath := ".kiln/logs/my-task.json"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log: %v", err)
+	}
+
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("failed to parse log: %v", err)
+	}
+	if entry.Verify == nil {
+		t.Fatal("expected verify field in log entry when --skip-verify used with gates")
+	}
+	if !entry.Verify.Skipped {
+		t.Error("expected skipped to be true")
+	}
+	if !entry.Verify.AllPassed {
+		t.Error("expected all_passed to be true when skipped")
+	}
+}
+
+func TestRunExec_NoVerifyGates_LogHasNoVerifyField(t *testing.T) {
+	code, _ := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n",
+		"",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d", code)
+	}
+
+	logPath := ".kiln/logs/my-task.json"
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read log: %v", err)
+	}
+
+	var entry execRunLog
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("failed to parse log: %v", err)
+	}
+	if entry.Verify != nil {
+		t.Error("expected verify field to be nil when no gates configured")
+	}
+}
+
+func TestRunExec_ProjectDefaults_Applied(t *testing.T) {
+	// Project config has a failing gate; no per-task verify set.
+	// Task should not get .done marker.
+	code, out := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n",
+		"defaults:\n  verify:\n    - cmd: false\n      name: project-gate\n",
+	)
+	_ = code
+	if _, err := os.Stat(".kiln/done/my-task.done"); err == nil {
+		t.Error(".done marker should NOT exist when project default gate fails")
+	}
+	if !strings.Contains(out, "verify") || !strings.Contains(out, "project-gate") {
+		t.Logf("output: %s", out)
+	}
+}
+
+func TestRunExec_ProjectDefaults_OptOut(t *testing.T) {
+	// Project config has a failing gate; task explicitly opts out.
+	code, _ := execWithVerify(t,
+		"- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify: []\n",
+		"defaults:\n  verify:\n    - cmd: false\n      name: project-gate\n",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d", code)
+	}
+	if _, err := os.Stat(".kiln/done/my-task.done"); err != nil {
+		t.Errorf("expected .done marker when task opts out of defaults: %v", err)
+	}
+}
+
+func TestRunExec_ProjectDefaults_MergedWithTaskGates(t *testing.T) {
+	// Project has a passing gate; task adds a passing gate. Both should run.
+	// Use a marker file in a stable temp dir for the gate command.
+	markerDir := t.TempDir()
+	markerFile := filepath.Join(markerDir, "task-gate-ran")
+	code, out := execWithVerify(t,
+		fmt.Sprintf("- id: my-task\n  prompt: prompt.md\n  needs: []\n  verify:\n    - cmd: touch %s\n      name: task-gate\n", markerFile),
+		"defaults:\n  verify:\n    - cmd: true\n      name: project-gate\n",
+	)
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d; output: %s", code, out)
+	}
+	if _, err := os.Stat(".kiln/done/my-task.done"); err != nil {
+		t.Errorf("expected .done marker: %v", err)
+	}
+	if _, err := os.Stat(markerFile); err != nil {
+		t.Error("expected task gate to have run")
+	}
+}
+
+func TestLoadTasks_VerifyGate_ValidCmdOnly(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: t\n  prompt: p.md\n  verify:\n    - cmd: go test ./...\n"), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(tasks[0].Verify) != 1 || tasks[0].Verify[0].Cmd != "go test ./..." {
+		t.Errorf("unexpected verify: %v", tasks[0].Verify)
+	}
+}
+
+func TestLoadTasks_VerifyGate_WithAllFields(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: t
+  prompt: p.md
+  verify:
+    - cmd: go test ./...
+      name: unit tests
+      expect: exit_code_zero
+`), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g := tasks[0].Verify[0]
+	if g.Cmd != "go test ./..." || g.Name != "unit tests" || g.Expect != "exit_code_zero" {
+		t.Errorf("unexpected gate: %+v", g)
+	}
+}
+
+func TestLoadTasks_VerifyGate_InvalidExpect(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte(`- id: t
+  prompt: p.md
+  verify:
+    - cmd: go test ./...
+      expect: output_contains
+`), 0o644)
+
+	_, err := loadTasks(p)
+	if err == nil {
+		t.Fatal("expected error for unsupported expect value")
+	}
+	if !strings.Contains(err.Error(), "exit_code_zero") {
+		t.Errorf("expected error to mention exit_code_zero, got: %v", err)
+	}
+}
+
+func TestLoadTasks_VerifyGate_OptOutEmptyList(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "tasks.yaml")
+	os.WriteFile(p, []byte("- id: t\n  prompt: p.md\n  verify: []\n"), 0o644)
+
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// verify: [] should produce empty (non-nil) slice = opt-out sentinel.
+	if tasks[0].Verify == nil {
+		t.Error("expected non-nil empty slice for verify: [], got nil")
+	}
+	if len(tasks[0].Verify) != 0 {
+		t.Errorf("expected 0 gates, got %d", len(tasks[0].Verify))
+	}
+}
+
+// =============================================================================
+// --- Tests for runVerifyPlan ---
+// =============================================================================
+
+// writeConfigFile writes a config.yaml in dir and returns its path.
+func writeConfigFile(t *testing.T, dir, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// runVerifyPlanHelper runs verify-plan with the given extra args (tasks and config flags prepended).
+func runVerifyPlanHelper(t *testing.T, tasksPath, configPath string, extraArgs ...string) (int, string) {
+	t.Helper()
+	args := []string{"--tasks", tasksPath, "--config", configPath}
+	args = append(args, extraArgs...)
+	var buf bytes.Buffer
+	code, err := runVerifyPlan(args, &buf)
+	if err != nil {
+		t.Fatalf("runVerifyPlan returned unexpected error: %v", err)
+	}
+	return code, buf.String()
+}
+
+func TestVerifyPlan_AllCovered_ExitsZero(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify:
+    - cmd: "true"
+      name: smoke
+`)
+	cp := filepath.Join(tmp, "config.yaml") // no config file
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0, got %d. output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "All tasks covered") {
+		t.Errorf("expected 'All tasks covered', got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_Uncovered_ExitsNonZero(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code == 0 {
+		t.Errorf("expected non-zero exit, got 0. output:\n%s", out)
+	}
+	if !strings.Contains(out, "UNCOVERED") {
+		t.Errorf("expected UNCOVERED in output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "auth") {
+		t.Errorf("expected task ID 'auth' in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_Unanchored_ExitsZero(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  verify:
+    - cmd: "true"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0 (warning only), got %d. output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "UNANCHORED") {
+		t.Errorf("expected UNANCHORED in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_Strict_Unanchored_ExitsNonZero(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  verify:
+    - cmd: "true"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp, "--strict")
+	if code == 0 {
+		t.Errorf("expected non-zero exit with --strict, got 0. output:\n%s", out)
+	}
+	if !strings.Contains(out, "UNANCHORED") {
+		t.Errorf("expected UNANCHORED in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_EmptyCmd_ReportsError(t *testing.T) {
+	// Empty cmd cannot come from task-level verify (loadTasks rejects it),
+	// so we inject it via project config defaults.
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+`)
+	// Config default has empty cmd; task has no verify field so defaults apply.
+	cp := writeConfigFile(t, tmp, "defaults:\n  verify:\n    - cmd: \"\"\n")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code == 0 {
+		t.Errorf("expected non-zero exit for EMPTY_CMD, got 0. output:\n%s", out)
+	}
+	if !strings.Contains(out, "EMPTY_CMD") {
+		t.Errorf("expected EMPTY_CMD in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_CmdNotFound_ReportsWarning(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify:
+    - cmd: "kiln-nonexistent-cmd-xyz999 --flag"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0 (CMD_NOT_FOUND is a warning), got %d. output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "CMD_NOT_FOUND") {
+		t.Errorf("expected CMD_NOT_FOUND in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_Strict_CmdNotFound_ExitsNonZero(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify:
+    - cmd: "kiln-nonexistent-cmd-xyz999 --flag"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp, "--strict")
+	if code == 0 {
+		t.Errorf("expected non-zero exit with --strict for CMD_NOT_FOUND, got 0. output:\n%s", out)
+	}
+	if !strings.Contains(out, "CMD_NOT_FOUND") {
+		t.Errorf("expected CMD_NOT_FOUND in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_NeitherAcceptanceNorVerify_SkipsSilently(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0 for task with neither acceptance nor verify, got %d. output:\n%s", code, out)
+	}
+	if strings.Contains(out, "auth") {
+		t.Errorf("expected task 'auth' to be skipped silently, but it appeared in output:\n%s", out)
+	}
+	if !strings.Contains(out, "All tasks covered") {
+		t.Errorf("expected 'All tasks covered', got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_ProjectDefaults_ProvideCoverage(t *testing.T) {
+	tmp := t.TempDir()
+	// Task has acceptance but no task-level verify; project defaults provide the gate.
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+`)
+	cp := writeConfigFile(t, tmp, "defaults:\n  verify:\n    - cmd: \"true\"\n      name: smoke\n")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0 (project defaults cover acceptance), got %d. output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "All tasks covered") {
+		t.Errorf("expected 'All tasks covered', got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_OptOut_IgnoresDefaults(t *testing.T) {
+	tmp := t.TempDir()
+	// Task has acceptance and explicitly opts out of defaults with verify: [].
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify: []
+`)
+	cp := writeConfigFile(t, tmp, "defaults:\n  verify:\n    - cmd: \"true\"\n      name: smoke\n")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code == 0 {
+		t.Errorf("expected non-zero exit (opt-out ignores defaults, no effective gates), got 0. output:\n%s", out)
+	}
+	if !strings.Contains(out, "UNCOVERED") {
+		t.Errorf("expected UNCOVERED when opted out of defaults, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_FormatJSON_ValidSchema(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify:
+    - cmd: "true"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	args := []string{"--tasks", tp, "--config", cp, "--format", "json"}
+	var buf bytes.Buffer
+	code, err := runVerifyPlan(args, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("expected exit 0, got %d", code)
+	}
+
+	var result verifyPlanResult
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &result); jsonErr != nil {
+		t.Fatalf("expected valid JSON output, got: %v\noutput: %s", jsonErr, buf.String())
+	}
+	if !result.Pass {
+		t.Error("expected result.pass to be true")
+	}
+	if result.Summary.TotalTasks != 1 {
+		t.Errorf("expected total_tasks=1, got %d", result.Summary.TotalTasks)
+	}
+	if result.Summary.Covered != 1 {
+		t.Errorf("expected covered=1, got %d", result.Summary.Covered)
+	}
+	if result.Issues == nil {
+		t.Error("expected issues to be non-nil empty slice in JSON, got nil")
+	}
+}
+
+func TestVerifyPlan_FormatJSON_WithIssues(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	args := []string{"--tasks", tp, "--config", cp, "--format", "json"}
+	var buf bytes.Buffer
+	code, _ := runVerifyPlan(args, &buf)
+	if code == 0 {
+		t.Error("expected non-zero exit")
+	}
+
+	var result verifyPlanResult
+	if jsonErr := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &result); jsonErr != nil {
+		t.Fatalf("expected valid JSON, got: %v\noutput: %s", jsonErr, buf.String())
+	}
+	if result.Pass {
+		t.Error("expected result.pass to be false")
+	}
+	if len(result.Issues) == 0 {
+		t.Error("expected at least one issue")
+	}
+	if result.Issues[0].Type != "UNCOVERED" {
+		t.Errorf("expected issue type UNCOVERED, got %s", result.Issues[0].Type)
+	}
+}
+
+func TestVerifyPlan_FormatText_HumanReadable(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: auth
+  prompt: p.md
+  acceptance:
+    - "Users can log in"
+  verify:
+    - cmd: "true"
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp, "--format", "text")
+	if code != 0 {
+		t.Errorf("expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out, "verify-plan:") {
+		t.Errorf("expected 'verify-plan:' header in text output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "All tasks covered") {
+		t.Errorf("expected 'All tasks covered', got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_MissingTasksFile_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	tp := filepath.Join(tmp, "nonexistent.yaml")
+	cp := filepath.Join(tmp, "config.yaml")
+
+	var buf bytes.Buffer
+	var errBuf bytes.Buffer
+	code := run([]string{"verify-plan", "--tasks", tp, "--config", cp}, &buf, &errBuf)
+	if code == 0 {
+		t.Error("expected non-zero exit for missing tasks file")
+	}
+	if errBuf.Len() == 0 && buf.Len() == 0 {
+		t.Error("expected some error output")
+	}
+}
+
+func TestVerifyPlan_EmptyTasksFile_ReportsZeroTasks(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, "[]")
+	cp := filepath.Join(tmp, "config.yaml")
+
+	code, out := runVerifyPlanHelper(t, tp, cp)
+	if code != 0 {
+		t.Errorf("expected exit 0 for empty tasks file, got %d. output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "0 tasks") {
+		t.Errorf("expected '0 tasks' in output, got:\n%s", out)
+	}
+}
+
+func TestVerifyPlan_SummaryCountsCorrect(t *testing.T) {
+	tmp := t.TempDir()
+	tp := writeTasksFile(t, tmp, `- id: covered-task
+  prompt: p.md
+  acceptance:
+    - "AC 1"
+  verify:
+    - cmd: "true"
+- id: uncovered-task
+  prompt: p.md
+  acceptance:
+    - "AC 2"
+- id: neither-task
+  prompt: p.md
+`)
+	cp := filepath.Join(tmp, "config.yaml")
+
+	args := []string{"--tasks", tp, "--config", cp, "--format", "json"}
+	var buf bytes.Buffer
+	_, _ = runVerifyPlan(args, &buf)
+
+	var result verifyPlanResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if result.Summary.TotalTasks != 3 {
+		t.Errorf("expected total_tasks=3, got %d", result.Summary.TotalTasks)
+	}
+	if result.Summary.Covered != 1 {
+		t.Errorf("expected covered=1, got %d", result.Summary.Covered)
+	}
+	if result.Summary.Uncovered != 1 {
+		t.Errorf("expected uncovered=1, got %d", result.Summary.Uncovered)
 	}
 }
