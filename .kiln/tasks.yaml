@@ -36,6 +36,7 @@
 
 - id: error-taxonomy
   prompt: .kiln/prompts/tasks/error-taxonomy.md
+  timeout: 90m
   dev-phase: 2
   needs:
     - state-resumability
