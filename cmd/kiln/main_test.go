@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +14,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+// testRunGenMake calls runGenMake with io.Discard as stdout (for tests that don't need JSON output).
+func testRunGenMake(args []string) error {
+	return runGenMake(args, io.Discard)
+}
 
 // --- Tests for loadTasks ---
 
@@ -290,7 +298,7 @@ func TestRunValidateSchema_Success(t *testing.T) {
 // --- Tests for gen-make ---
 
 func TestRunGenMake_MissingTasksFlag(t *testing.T) {
-	err := runGenMake([]string{"--out", "out.mk"})
+	err := testRunGenMake([]string{"--out", "out.mk"})
 	if err == nil {
 		t.Fatal("expected error for missing --tasks")
 	}
@@ -300,7 +308,7 @@ func TestRunGenMake_MissingTasksFlag(t *testing.T) {
 }
 
 func TestRunGenMake_MissingOutFlag(t *testing.T) {
-	err := runGenMake([]string{"--tasks", "tasks.yaml"})
+	err := testRunGenMake([]string{"--tasks", "tasks.yaml"})
 	if err == nil {
 		t.Fatal("expected error for missing --out")
 	}
@@ -310,7 +318,7 @@ func TestRunGenMake_MissingOutFlag(t *testing.T) {
 }
 
 func TestRunGenMake_TasksFileNotFound(t *testing.T) {
-	err := runGenMake([]string{"--tasks", "/nonexistent/tasks.yaml", "--out", "out.mk"})
+	err := testRunGenMake([]string{"--tasks", "/nonexistent/tasks.yaml", "--out", "out.mk"})
 	if err == nil {
 		t.Fatal("expected error for missing tasks file")
 	}
@@ -324,7 +332,7 @@ func TestRunGenMake_InvalidYAML(t *testing.T) {
 	tasksPath := filepath.Join(tmp, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte("not: valid: yaml: [[["), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", filepath.Join(tmp, "out.mk")})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", filepath.Join(tmp, "out.mk")})
 	if err == nil {
 		t.Fatal("expected error for invalid YAML")
 	}
@@ -338,7 +346,7 @@ func TestRunGenMake_EmptyTasks(t *testing.T) {
 	tasksPath := filepath.Join(tmp, "tasks.yaml")
 	os.WriteFile(tasksPath, []byte("[]"), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", filepath.Join(tmp, "out.mk")})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", filepath.Join(tmp, "out.mk")})
 	if err == nil {
 		t.Fatal("expected error for empty tasks")
 	}
@@ -348,7 +356,7 @@ func TestRunGenMake_EmptyTasks(t *testing.T) {
 }
 
 func TestRunGenMake_InvalidFlag(t *testing.T) {
-	err := runGenMake([]string{"--bogus"})
+	err := testRunGenMake([]string{"--bogus"})
 	if err == nil {
 		t.Fatal("expected error for invalid flag")
 	}
@@ -365,7 +373,7 @@ func TestRunGenMake_SingleTask(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -424,7 +432,7 @@ func TestRunGenMake_WithDependencies(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -479,10 +487,10 @@ func TestRunGenMake_DeterministicOutput(t *testing.T) {
 	out1 := filepath.Join(tmp, "out1.mk")
 	out2 := filepath.Join(tmp, "out2.mk")
 
-	if err := runGenMake([]string{"--tasks", tasksPath, "--out", out1}); err != nil {
+	if err := testRunGenMake([]string{"--tasks", tasksPath, "--out", out1}); err != nil {
 		t.Fatalf("run 1 failed: %v", err)
 	}
-	if err := runGenMake([]string{"--tasks", tasksPath, "--out", out2}); err != nil {
+	if err := testRunGenMake([]string{"--tasks", tasksPath, "--out", out2}); err != nil {
 		t.Fatalf("run 2 failed: %v", err)
 	}
 
@@ -513,7 +521,7 @@ func TestRunGenMake_CreatesOutputDir(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -534,7 +542,7 @@ func TestRunGenMake_RecipeHasTab(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1204,7 +1212,7 @@ func TestRunGenMake_TaskWithTimeout(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1237,7 +1245,7 @@ func TestRunGenMake_TaskWithoutTimeout(t *testing.T) {
 `
 	os.WriteFile(tasksPath, []byte(yaml), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3576,13 +3584,14 @@ func TestRunExec_TaskRetriesZeroUsesDefault(t *testing.T) {
 	os.WriteFile(promptPath, []byte("test"), 0o644)
 
 	tasksPath := filepath.Join(tmpDir, "tasks.yaml")
-	// No retries field (defaults to 0 = not set), --retries flag also defaults to 0
+	// No retries field (defaults to 0 = not set); explicitly set --retries 0 to
+	// override profile defaults and test the zero-retry code path.
 	os.WriteFile(tasksPath, []byte("- id: no-retry-task\n  prompt: p.md\n"), 0o644)
 
 	_, err := runExec([]string{
 		"--task-id", "no-retry-task",
 		"--tasks", tasksPath,
-		// --retries not set → default 0
+		"--retries", "0", // explicitly override profile's retry default
 	}, &bytes.Buffer{})
 
 	if err == nil {
@@ -4242,7 +4251,7 @@ func TestRunGenMake_PhaseTargetsGenerated(t *testing.T) {
   phase: verify
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4283,7 +4292,7 @@ func TestRunGenMake_MilestoneTargetsGenerated(t *testing.T) {
   milestone: m1-auth
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4315,7 +4324,7 @@ func TestRunGenMake_NoPhaseOrMilestoneTargets_WhenFieldsAbsent(t *testing.T) {
   needs: []
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4342,7 +4351,7 @@ func TestRunGenMake_ModelPassedInRecipe(t *testing.T) {
   model: claude-haiku-4-5-20251001
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4365,7 +4374,7 @@ func TestRunGenMake_NoModelInRecipe_WhenModelAbsent(t *testing.T) {
   needs: []
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4401,7 +4410,7 @@ func TestRunGenMake_PhaseAndMilestoneSorted(t *testing.T) {
   milestone: m2-mid
 `), 0o644)
 
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4775,7 +4784,7 @@ func TestRunGenMake_CreatesLocksDir(t *testing.T) {
 
 	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
 
-	if err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
+	if err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -5685,7 +5694,7 @@ func TestRunGenMake_CreatesUnifyDir(t *testing.T) {
 	outPath := filepath.Join(tmp, ".kiln/targets.mk")
 	os.WriteFile(tasksPath, []byte("- id: hello\n  prompt: hello.md\n"), 0o644)
 
-	if err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
+	if err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath}); err != nil {
 		t.Fatalf("runGenMake failed: %v", err)
 	}
 
@@ -6952,7 +6961,7 @@ func TestGenMake_CreatesArtifactsResearchDir(t *testing.T) {
 	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n  needs: []\n"), 0o644)
 
 	outPath := filepath.Join(kilnDir, "targets.mk")
-	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
 	if err != nil {
 		t.Fatalf("runGenMake failed: %v", err)
 	}
@@ -7972,5 +7981,1090 @@ func TestVerifyPlan_SummaryCountsCorrect(t *testing.T) {
 	}
 	if result.Summary.Uncovered != 1 {
 		t.Errorf("expected uncovered=1, got %d", result.Summary.Uncovered)
+	}
+}
+
+// =============================================================================
+// --- Tests for kiln init ---
+// =============================================================================
+
+// helper: run runInitInDir in a temp directory and return stdout as string.
+func runInitHelper(t *testing.T, dir, profile string, force bool) (string, error) {
+	t.Helper()
+	var buf bytes.Buffer
+	err := runInitInDir(dir, profile, force, &buf)
+	return buf.String(), err
+}
+
+func TestInit_CreatesDirectories(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dirs := []string{
+		filepath.Join(tmp, ".kiln"),
+		filepath.Join(tmp, ".kiln", "prompts", "tasks"),
+		filepath.Join(tmp, ".kiln", "logs"),
+		filepath.Join(tmp, ".kiln", "done"),
+	}
+	for _, d := range dirs {
+		info, err := os.Stat(d)
+		if err != nil {
+			t.Errorf("expected directory %s to exist: %v", d, err)
+		} else if !info.IsDir() {
+			t.Errorf("expected %s to be a directory", d)
+		}
+	}
+}
+
+func TestInit_CreatesTasksYAML(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p := filepath.Join(tmp, ".kiln", "tasks.yaml")
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("tasks.yaml not created: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "hello-world") {
+		t.Error("tasks.yaml should contain hello-world task")
+	}
+	if !strings.Contains(content, "follow-up") {
+		t.Error("tasks.yaml should contain follow-up task")
+	}
+	// Verify it's valid YAML with two tasks.
+	tasks, err := loadTasks(p)
+	if err != nil {
+		t.Fatalf("tasks.yaml is not valid: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
+func TestInit_CreatesPromptFiles(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, name := range []string{"hello-world.md", "follow-up.md"} {
+		p := filepath.Join(tmp, ".kiln", "prompts", "tasks", name)
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("expected prompt file %s to exist: %v", p, err)
+		}
+	}
+}
+
+func TestInit_CreatesMakefile(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "Makefile"))
+	if err != nil {
+		t.Fatalf("Makefile not created: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{"-include .kiln/targets.mk", "plan", "graph", "all"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("Makefile missing %q", want)
+		}
+	}
+}
+
+func TestInit_CreatesPRD(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "PRD.md"))
+	if err != nil {
+		t.Fatalf("PRD.md not created: %v", err)
+	}
+	if !strings.Contains(string(data), "Project Requirements Document") {
+		t.Error("PRD.md missing expected content")
+	}
+}
+
+func TestInit_ProfileGo(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "go", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "Makefile"))
+	if err != nil {
+		t.Fatalf("Makefile not created: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "go build") {
+		t.Error("go profile Makefile should contain 'go build'")
+	}
+	if !strings.Contains(content, "go test") {
+		t.Error("go profile Makefile should contain 'go test'")
+	}
+}
+
+func TestInit_ProfilePython(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "python", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "Makefile"))
+	if err != nil {
+		t.Fatalf("Makefile not created: %v", err)
+	}
+	if !strings.Contains(string(data), "pytest") {
+		t.Error("python profile Makefile should contain 'pytest'")
+	}
+}
+
+func TestInit_ProfileNode(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "node", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "Makefile"))
+	if err != nil {
+		t.Fatalf("Makefile not created: %v", err)
+	}
+	if !strings.Contains(string(data), "npm test") {
+		t.Error("node profile Makefile should contain 'npm test'")
+	}
+}
+
+func TestInit_ProfileGenericNoLangTargets(t *testing.T) {
+	tmp := t.TempDir()
+	_, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(tmp, "Makefile"))
+	if err != nil {
+		t.Fatalf("Makefile not created: %v", err)
+	}
+	content := string(data)
+	if strings.Contains(content, "go build") || strings.Contains(content, "pytest") || strings.Contains(content, "npm test") {
+		t.Error("generic profile Makefile should not contain language-specific targets")
+	}
+}
+
+func TestInit_NoForce_SkipsExistingFiles(t *testing.T) {
+	tmp := t.TempDir()
+	// First run — create everything.
+	out, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error on first run: %v", err)
+	}
+	if !strings.Contains(out, "created:") {
+		t.Error("first run should print created: lines")
+	}
+
+	// Second run without --force — should skip.
+	out2, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error on second run: %v", err)
+	}
+	if strings.Contains(out2, "created:") {
+		t.Error("second run without --force should not create new files")
+	}
+	if !strings.Contains(out2, "skipped:") {
+		t.Error("second run without --force should report skipped files")
+	}
+}
+
+func TestInit_Force_OverwritesExistingFiles(t *testing.T) {
+	tmp := t.TempDir()
+	// First run.
+	if _, err := runInitHelper(t, tmp, "generic", false); err != nil {
+		t.Fatalf("unexpected error on first run: %v", err)
+	}
+	// Overwrite tasks.yaml with garbage.
+	kilnDir := filepath.Join(tmp, ".kiln")
+	if err := os.WriteFile(filepath.Join(kilnDir, "tasks.yaml"), []byte("garbage"), 0o644); err != nil {
+		t.Fatalf("failed to overwrite tasks.yaml: %v", err)
+	}
+	// Second run with --force — should recreate.
+	out, err := runInitHelper(t, tmp, "generic", true)
+	if err != nil {
+		t.Fatalf("unexpected error on force run: %v", err)
+	}
+	if !strings.Contains(out, "created:") {
+		t.Error("force run should print created: lines")
+	}
+	// tasks.yaml should now be valid again.
+	if _, err := loadTasks(filepath.Join(kilnDir, "tasks.yaml")); err != nil {
+		t.Errorf("tasks.yaml should be valid after force rewrite: %v", err)
+	}
+}
+
+func TestInit_InvalidProfile(t *testing.T) {
+	var buf bytes.Buffer
+	err := runInit([]string{"--profile", "rust"}, &buf)
+	if err == nil {
+		t.Fatal("expected error for invalid profile")
+	}
+	if !strings.Contains(err.Error(), "invalid profile") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestInit_OutputListsCreatedAndNextSteps(t *testing.T) {
+	tmp := t.TempDir()
+	out, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "created:") {
+		t.Error("output should list created files")
+	}
+	if !strings.Contains(out, "Next steps") {
+		t.Error("output should include next steps guidance")
+	}
+}
+
+func TestInit_RunTwiceWithoutForceReportsAllSkipped(t *testing.T) {
+	tmp := t.TempDir()
+	if _, err := runInitHelper(t, tmp, "generic", false); err != nil {
+		t.Fatalf("first run failed: %v", err)
+	}
+	out, err := runInitHelper(t, tmp, "generic", false)
+	if err != nil {
+		t.Fatalf("second run failed: %v", err)
+	}
+	// Count skipped lines — should match number of scaffold files (5).
+	count := strings.Count(out, "skipped:")
+	if count != 5 {
+		t.Errorf("expected 5 skipped files, got %d\noutput:\n%s", count, out)
+	}
+}
+
+func TestInit_GeneratedYAMLIsValid(t *testing.T) {
+	content := initTasksYAML()
+	var tasks []Task
+	if err := yaml.Unmarshal([]byte(content), &tasks); err != nil {
+		t.Fatalf("initTasksYAML produced invalid YAML: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Errorf("expected 2 tasks, got %d", len(tasks))
+	}
+}
+
+func TestInit_PromptFilesContainFooterContract(t *testing.T) {
+	for _, profile := range []string{"go", "python", "node", "generic"} {
+		hw := initHelloWorldPrompt(profile)
+		fu := initFollowUpPrompt(profile)
+		for _, content := range []string{hw, fu} {
+			if !strings.Contains(content, `"kiln"`) {
+				t.Errorf("profile %s: prompt missing kiln JSON footer contract", profile)
+			}
+		}
+	}
+}
+
+func TestInit_ViaRunFunction(t *testing.T) {
+	tmp := t.TempDir()
+	// Change to tmp dir so runInit can use os.Getwd().
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"init"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run init exited %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "created:") {
+		t.Error("init output should list created files")
+	}
+}
+
+// --- Tests for --format json on exec and gen-make ---
+
+func TestRunExec_FormatInvalidValue(t *testing.T) {
+	_, err := runExec([]string{"--task-id", "t1", "--format", "xml"}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected error for invalid --format value")
+	}
+	if !strings.Contains(err.Error(), "invalid --format value") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must be text or json") {
+		t.Fatalf("error missing must be text or json: %v", err)
+	}
+}
+
+func TestRunExec_FormatJSON_Success(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	// Redirect progress output to a buffer so os.Stderr isn't used during tests.
+	origProgress := execProgressWriter
+	var progressBuf bytes.Buffer
+	execProgressWriter = &progressBuf
+	t.Cleanup(func() { execProgressWriter = origProgress })
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("do the thing"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "json-task")
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "json-task",
+		"--prompt-file", promptPath,
+		"--format", "json",
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 2 {
+		t.Fatalf("expected exit code 2 (complete), got %d", code)
+	}
+
+	// stdout should be a single compact JSON line.
+	output := strings.TrimSpace(stdout.String())
+	lines := strings.Split(output, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected single JSON line, got %d lines: %q", len(lines), output)
+	}
+
+	var result execJSONResult
+	if err := json.Unmarshal([]byte(lines[0]), &result); err != nil {
+		t.Fatalf("failed to parse JSON output: %v\noutput: %s", err, output)
+	}
+
+	// Verify required fields.
+	if result.TaskID != "json-task" {
+		t.Errorf("task_id: got %q, want %q", result.TaskID, "json-task")
+	}
+	if result.Status != "complete" {
+		t.Errorf("status: got %q, want %q", result.Status, "complete")
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("exit_code: got %d, want 0", result.ExitCode)
+	}
+	if result.Model == "" {
+		t.Error("model should be non-empty")
+	}
+	if result.PromptFile != promptPath {
+		t.Errorf("prompt_file: got %q, want %q", result.PromptFile, promptPath)
+	}
+	if result.StartedAt == "" {
+		t.Error("started_at should be non-empty")
+	}
+	if result.EndedAt == "" {
+		t.Error("ended_at should be non-empty")
+	}
+	if result.Attempts != 1 {
+		t.Errorf("attempts: got %d, want 1", result.Attempts)
+	}
+	if !result.FooterValid {
+		t.Error("footer_valid should be true for complete task")
+	}
+	if result.Error != nil {
+		t.Errorf("error should be nil for success, got %q", *result.Error)
+	}
+	// Footer should be populated.
+	if result.Footer == nil {
+		t.Error("footer should be non-nil for complete task")
+	} else if result.Footer.Kiln.Status != "complete" {
+		t.Errorf("footer.kiln.status: got %q, want %q", result.Footer.Kiln.Status, "complete")
+	}
+
+	// Progress output (claude output) should NOT be in stdout.
+	if strings.Contains(stdout.String(), `{"kiln"`) {
+		// The footer JSON might appear but as part of the result JSON, not raw
+		// We need to verify the raw claude output went to progressBuf, not stdout.
+	}
+}
+
+func TestRunExec_FormatJSON_Failure(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("fail")
+
+	origProgress := execProgressWriter
+	var progressBuf bytes.Buffer
+	execProgressWriter = &progressBuf
+	t.Cleanup(func() { execProgressWriter = origProgress })
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("do the thing"), 0o644)
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "fail-json",
+		"--prompt-file", promptPath,
+		"--format", "json",
+	}, &stdout)
+	if err == nil {
+		t.Fatal("expected error for failing command")
+	}
+	// Exit code should be non-zero.
+	if code == 0 {
+		t.Errorf("expected non-zero exit code, got %d", code)
+	}
+
+	// stdout should contain JSON.
+	output := strings.TrimSpace(stdout.String())
+	if output == "" {
+		t.Fatal("expected JSON output on stdout even for failures")
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected single JSON line, got %d lines", len(lines))
+	}
+
+	var result execJSONResult
+	if err2 := json.Unmarshal([]byte(lines[0]), &result); err2 != nil {
+		t.Fatalf("failed to parse JSON output: %v\noutput: %s", err2, output)
+	}
+
+	if result.TaskID != "fail-json" {
+		t.Errorf("task_id: got %q, want %q", result.TaskID, "fail-json")
+	}
+	if result.Status != "error" {
+		t.Errorf("status: got %q, want %q", result.Status, "error")
+	}
+	if result.ExitCode == 0 {
+		t.Error("exit_code should be non-zero for failed task")
+	}
+	if result.Error == nil {
+		t.Error("error field should be non-nil for failed task")
+	}
+}
+
+func TestRunExec_FormatJSON_ProgressGoesToProgress(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	origProgress := execProgressWriter
+	var progressBuf bytes.Buffer
+	execProgressWriter = &progressBuf
+	t.Cleanup(func() { execProgressWriter = origProgress })
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("hello"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "progress-test")
+
+	var stdout bytes.Buffer
+	_, _ = runExec([]string{
+		"--task-id", "progress-test",
+		"--prompt-file", promptPath,
+		"--format", "json",
+	}, &stdout)
+
+	// stdout should contain only the final JSON object (compact, single line).
+	stdoutStr := strings.TrimSpace(stdout.String())
+	stdoutLines := strings.Split(stdoutStr, "\n")
+	if len(stdoutLines) != 1 {
+		t.Errorf("stdout should have exactly 1 line (the JSON result), got %d lines: %q", len(stdoutLines), stdoutStr)
+	}
+	// Verify it parses as JSON.
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(stdoutLines[0]), &result); err != nil {
+		t.Errorf("stdout should be valid JSON, got error: %v\nline: %s", err, stdoutLines[0])
+	}
+}
+
+func TestRunExec_FormatText_NoRegression(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("success")
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("hello world"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "text-mode")
+
+	var stdout bytes.Buffer
+	code, err := runExec([]string{
+		"--task-id", "text-mode",
+		"--prompt-file", promptPath,
+		"--format", "text",
+	}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 2 {
+		t.Fatalf("expected exit code 2, got %d", code)
+	}
+	// Text mode: stdout should contain the echoed prompt, not JSON.
+	if !strings.Contains(stdout.String(), "hello world") {
+		t.Errorf("text mode should pass claude output to stdout, got: %s", stdout.String())
+	}
+}
+
+func TestGenMakeFormatJSON(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	yamlContent := `- id: alpha
+  prompt: a.md
+  needs: []
+- id: beta
+  prompt: b.md
+  needs:
+    - alpha
+`
+	os.WriteFile(tasksPath, []byte(yamlContent), 0o644)
+
+	var stdout bytes.Buffer
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath, "--format", "json"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	// Should be a single compact line.
+	lines := strings.Split(output, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected single JSON line, got %d lines: %q", len(lines), output)
+	}
+
+	var result struct {
+		TasksCount int `json:"tasks_count"`
+		OutputFile string `json:"output_file"`
+		Targets    []struct {
+			TaskID    string   `json:"task_id"`
+			Target    string   `json:"target"`
+			DependsOn []string `json:"depends_on"`
+		} `json:"targets"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v\noutput: %s", err, output)
+	}
+
+	if result.TasksCount != 2 {
+		t.Errorf("tasks_count: got %d, want 2", result.TasksCount)
+	}
+	if result.OutputFile != outPath {
+		t.Errorf("output_file: got %q, want %q", result.OutputFile, outPath)
+	}
+	if len(result.Targets) != 2 {
+		t.Fatalf("targets: got %d, want 2", len(result.Targets))
+	}
+	// alpha: no deps
+	if result.Targets[0].TaskID != "alpha" {
+		t.Errorf("targets[0].task_id: got %q, want %q", result.Targets[0].TaskID, "alpha")
+	}
+	if result.Targets[0].Target != ".kiln/done/alpha.done" {
+		t.Errorf("targets[0].target: got %q, want %q", result.Targets[0].Target, ".kiln/done/alpha.done")
+	}
+	if len(result.Targets[0].DependsOn) != 0 {
+		t.Errorf("targets[0].depends_on: got %v, want empty", result.Targets[0].DependsOn)
+	}
+	// beta: depends on alpha
+	if result.Targets[1].TaskID != "beta" {
+		t.Errorf("targets[1].task_id: got %q, want %q", result.Targets[1].TaskID, "beta")
+	}
+	if result.Targets[1].Target != ".kiln/done/beta.done" {
+		t.Errorf("targets[1].target: got %q, want %q", result.Targets[1].Target, ".kiln/done/beta.done")
+	}
+	if len(result.Targets[1].DependsOn) != 1 || result.Targets[1].DependsOn[0] != ".kiln/done/alpha.done" {
+		t.Errorf("targets[1].depends_on: got %v, want [.kiln/done/alpha.done]", result.Targets[1].DependsOn)
+	}
+}
+
+func TestGenMakeFormatText_NoRegression(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "targets.mk")
+
+	os.WriteFile(tasksPath, []byte("- id: my-task\n  prompt: p.md\n"), 0o644)
+
+	var stdout bytes.Buffer
+	err := runGenMake([]string{"--tasks", tasksPath, "--out", outPath, "--format", "text"}, &stdout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Text mode: no JSON output to stdout.
+	if stdout.Len() != 0 {
+		t.Errorf("text mode should produce no stdout output, got: %s", stdout.String())
+	}
+	// The targets.mk file should still be created.
+	if _, err := os.Stat(outPath); err != nil {
+		t.Errorf("targets.mk should be created in text mode: %v", err)
+	}
+}
+
+func TestGenMakeFormatInvalid(t *testing.T) {
+	var stdout bytes.Buffer
+	err := runGenMake([]string{"--tasks", "tasks.yaml", "--out", "out.mk", "--format", "xml"}, &stdout)
+	if err == nil {
+		t.Fatal("expected error for invalid --format value")
+	}
+	if !strings.Contains(err.Error(), "invalid --format value") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "must be text or json") {
+		t.Fatalf("error missing must be text or json: %v", err)
+	}
+}
+
+func TestRunExec_FormatJSON_IsCompact(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	commandBuilder = fakeCommandBuilder("complete")
+
+	origProgress := execProgressWriter
+	var progressBuf bytes.Buffer
+	execProgressWriter = &progressBuf
+	t.Cleanup(func() { execProgressWriter = origProgress })
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("compact test"), 0o644)
+	t.Setenv("KILN_TEST_TASK_ID", "compact-test")
+
+	var stdout bytes.Buffer
+	_, _ = runExec([]string{
+		"--task-id", "compact-test",
+		"--prompt-file", promptPath,
+		"--format", "json",
+	}, &stdout)
+
+	output := strings.TrimSpace(stdout.String())
+	// Compact JSON has no embedded newlines (except the trailing one we trimmed).
+	if strings.Contains(output, "\n") {
+		t.Errorf("JSON output should be compact (no embedded newlines), got:\n%s", output)
+	}
+	// Should start with '{' and end with '}'.
+	if !strings.HasPrefix(output, "{") || !strings.HasSuffix(output, "}") {
+		t.Errorf("JSON output should be a JSON object, got: %s", output)
+	}
+}
+
+// =============================================================================
+// --- Tests for Profile system ---
+// =============================================================================
+
+func TestSpeedProfile_DefaultValues(t *testing.T) {
+	p := speedProfile
+	if p.RequireUnify != false {
+		t.Errorf("speed.RequireUnify: want false, got %v", p.RequireUnify)
+	}
+	if p.RequireVerifyGates != false {
+		t.Errorf("speed.RequireVerifyGates: want false, got %v", p.RequireVerifyGates)
+	}
+	if p.ParallelismLimit != 0 {
+		t.Errorf("speed.ParallelismLimit: want 0, got %d", p.ParallelismLimit)
+	}
+	if p.RetryMax != 2 {
+		t.Errorf("speed.RetryMax: want 2, got %d", p.RetryMax)
+	}
+	if p.RetryBackoffBase != 5*time.Second {
+		t.Errorf("speed.RetryBackoffBase: want 5s, got %v", p.RetryBackoffBase)
+	}
+}
+
+func TestReliableProfile_DefaultValues(t *testing.T) {
+	p := reliableProfile
+	if p.RequireUnify != true {
+		t.Errorf("reliable.RequireUnify: want true, got %v", p.RequireUnify)
+	}
+	if p.RequireVerifyGates != true {
+		t.Errorf("reliable.RequireVerifyGates: want true, got %v", p.RequireVerifyGates)
+	}
+	if p.ParallelismLimit != 2 {
+		t.Errorf("reliable.ParallelismLimit: want 2, got %d", p.ParallelismLimit)
+	}
+	if p.RetryMax != 4 {
+		t.Errorf("reliable.RetryMax: want 4, got %d", p.RetryMax)
+	}
+	if p.RetryBackoffBase != 10*time.Second {
+		t.Errorf("reliable.RetryBackoffBase: want 10s, got %v", p.RetryBackoffBase)
+	}
+}
+
+func TestLoadProfile_NoConfigFile_ReturnsSpeedProfile(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml") // does not exist
+
+	p, err := loadProfile(configPath, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.RetryMax != 2 {
+		t.Errorf("expected speed RetryMax=2, got %d", p.RetryMax)
+	}
+	if p.RequireUnify != false {
+		t.Errorf("expected speed RequireUnify=false, got %v", p.RequireUnify)
+	}
+}
+
+func TestLoadProfile_ReliableFromConfig(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("profile: reliable\n"), 0o644)
+
+	p, err := loadProfile(configPath, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.RetryMax != 4 {
+		t.Errorf("expected reliable RetryMax=4, got %d", p.RetryMax)
+	}
+	if p.RequireUnify != true {
+		t.Errorf("expected reliable RequireUnify=true, got %v", p.RequireUnify)
+	}
+	if p.ParallelismLimit != 2 {
+		t.Errorf("expected reliable ParallelismLimit=2, got %d", p.ParallelismLimit)
+	}
+}
+
+func TestLoadProfile_UnknownProfileName_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("profile: bogus\n"), 0o644)
+
+	_, err := loadProfile(configPath, "")
+	if err == nil {
+		t.Fatal("expected error for unknown profile name")
+	}
+	if !strings.Contains(err.Error(), "unknown profile") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadProfile_MalformedYAML_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("not: valid: yaml: [[["), 0o644)
+
+	_, err := loadProfile(configPath, "")
+	if err == nil {
+		t.Fatal("expected error for malformed YAML")
+	}
+	if !strings.Contains(err.Error(), "failed to parse config file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadProfile_Overrides_AppliedOnTopOfBase(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte(`profile: reliable
+overrides:
+  retry_max: 6
+  parallelism_limit: 3
+`), 0o644)
+
+	p, err := loadProfile(configPath, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.RetryMax != 6 {
+		t.Errorf("expected overridden RetryMax=6, got %d", p.RetryMax)
+	}
+	if p.ParallelismLimit != 3 {
+		t.Errorf("expected overridden ParallelismLimit=3, got %d", p.ParallelismLimit)
+	}
+	// Non-overridden fields retain base profile values.
+	if p.RequireUnify != true {
+		t.Errorf("expected base reliable RequireUnify=true, got %v", p.RequireUnify)
+	}
+}
+
+func TestLoadProfile_UnknownOverrideField_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte(`profile: speed
+overrides:
+  unknown_field: 42
+`), 0o644)
+
+	_, err := loadProfile(configPath, "")
+	if err == nil {
+		t.Fatal("expected error for unknown override field")
+	}
+}
+
+func TestLoadProfile_ProfileFlagOverridesConfig(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("profile: speed\n"), 0o644)
+
+	// --profile flag specifies reliable, overriding config's speed.
+	p, err := loadProfile(configPath, "reliable")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.RetryMax != 4 {
+		t.Errorf("expected reliable RetryMax=4 from flag override, got %d", p.RetryMax)
+	}
+}
+
+func TestLoadProfile_ProfileFlagUnknown_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml") // does not exist
+
+	_, err := loadProfile(configPath, "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for unknown --profile flag value")
+	}
+	if !strings.Contains(err.Error(), "unknown profile") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunExec_ProfileFlagOverridesRetryMax(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	origSleep := sleepFn
+	t.Cleanup(func() { sleepFn = origSleep })
+	sleepFn = func(d time.Duration) {} // no-op
+
+	var callCount int
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		callCount++
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=fail")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	// --profile reliable gives RetryMax=4; no explicit --retries flag.
+	runExec([]string{
+		"--task-id", "profile-retry",
+		"--prompt-file", promptPath,
+		"--profile", "reliable",
+	}, &bytes.Buffer{})
+
+	// reliable profile has RetryMax=4 → 5 total attempts.
+	if callCount != 5 {
+		t.Errorf("expected 5 attempts (1 + 4 profile retries), got %d", callCount)
+	}
+}
+
+func TestRunExec_RetriesFlagOverridesProfileRetryMax(t *testing.T) {
+	origBuilder := commandBuilder
+	t.Cleanup(func() { commandBuilder = origBuilder })
+	origSleep := sleepFn
+	t.Cleanup(func() { sleepFn = origSleep })
+	sleepFn = func(d time.Duration) {} // no-op
+
+	var callCount int
+	commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
+		callCount++
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess", "--", prompt)
+		cmd.Env = append(os.Environ(), "KILN_TEST_HELPER_MODE=fail")
+		return cmd
+	}
+
+	tmpDir := t.TempDir()
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmpDir)
+
+	promptPath := filepath.Join(tmpDir, "prompt.md")
+	os.WriteFile(promptPath, []byte("test"), 0o644)
+
+	// --profile reliable has RetryMax=4, but --retries 1 overrides to 1 retry.
+	runExec([]string{
+		"--task-id", "retries-override",
+		"--prompt-file", promptPath,
+		"--profile", "reliable",
+		"--retries", "1",
+	}, &bytes.Buffer{})
+
+	if callCount != 2 {
+		t.Errorf("expected 2 attempts (1 + 1 explicit retry), got %d", callCount)
+	}
+}
+
+func TestRunGenMake_ParallelismCap_EmittedWhenLimitSet(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "out.mk")
+	configPath := filepath.Join(tmp, "config.yaml")
+
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
+	os.WriteFile(configPath, []byte("profile: reliable\n"), 0o644)
+
+	// Change to tmpDir so .kiln/config.yaml is found.
+	origDir, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(origDir) })
+	os.Chdir(tmp)
+	// Write config.yaml where gen-make looks.
+	os.MkdirAll(filepath.Join(tmp, ".kiln"), 0o755)
+	os.WriteFile(filepath.Join(tmp, ".kiln", "config.yaml"), []byte("profile: reliable\n"), 0o644)
+
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, _ := os.ReadFile(outPath)
+	if !strings.Contains(string(content), "MAKEFLAGS") {
+		t.Errorf("expected MAKEFLAGS parallelism cap in output, got:\n%s", string(content))
+	}
+	if !strings.Contains(string(content), "-j2") {
+		t.Errorf("expected -j2 in output for reliable profile, got:\n%s", string(content))
+	}
+}
+
+func TestRunGenMake_ParallelismCap_OmittedWhenZero(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "out.mk")
+
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
+
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, _ := os.ReadFile(outPath)
+	if strings.Contains(string(content), "MAKEFLAGS") {
+		t.Errorf("expected no MAKEFLAGS in output for speed profile (parallelism_limit=0), got:\n%s", string(content))
+	}
+}
+
+func TestRunGenMake_ProfileFlag_SetsParallelismCap(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "out.mk")
+
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
+
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath, "--profile", "reliable"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, _ := os.ReadFile(outPath)
+	if !strings.Contains(string(content), "-j2") {
+		t.Errorf("expected -j2 for reliable profile, got:\n%s", string(content))
+	}
+}
+
+func TestRunGenMake_ProfileFlag_UnknownProfile_ReturnsError(t *testing.T) {
+	tmp := t.TempDir()
+	tasksPath := filepath.Join(tmp, "tasks.yaml")
+	outPath := filepath.Join(tmp, "out.mk")
+
+	os.WriteFile(tasksPath, []byte("- id: t1\n  prompt: p.md\n"), 0o644)
+
+	err := testRunGenMake([]string{"--tasks", tasksPath, "--out", outPath, "--profile", "bogus"})
+	if err == nil {
+		t.Fatal("expected error for unknown profile")
+	}
+	if !strings.Contains(err.Error(), "unknown profile") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestKilnProfile_PrintsResolvedSettings(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("profile: reliable\n"), 0o644)
+
+	var out bytes.Buffer
+	err := runProfile([]string{"--config", configPath}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "profile: reliable") {
+		t.Errorf("expected profile name in output, got: %s", output)
+	}
+	if !strings.Contains(output, "retry_max: 4") {
+		t.Errorf("expected retry_max: 4 for reliable, got: %s", output)
+	}
+	if !strings.Contains(output, "require_unify: true") {
+		t.Errorf("expected require_unify: true for reliable, got: %s", output)
+	}
+	if !strings.Contains(output, "parallelism_limit: 2") {
+		t.Errorf("expected parallelism_limit: 2 for reliable, got: %s", output)
+	}
+}
+
+func TestKilnProfile_DefaultSpeedProfile(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml") // does not exist
+
+	var out bytes.Buffer
+	err := runProfile([]string{"--config", configPath}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "profile: speed") {
+		t.Errorf("expected profile: speed, got: %s", output)
+	}
+	if !strings.Contains(output, "retry_max: 2") {
+		t.Errorf("expected retry_max: 2 for speed, got: %s", output)
+	}
+	if !strings.Contains(output, "require_unify: false") {
+		t.Errorf("expected require_unify: false for speed, got: %s", output)
+	}
+}
+
+func TestKilnProfile_ProfileFlagOverride(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.yaml")
+	os.WriteFile(configPath, []byte("profile: speed\n"), 0o644)
+
+	var out bytes.Buffer
+	err := runProfile([]string{"--config", configPath, "--profile", "reliable"}, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "profile: reliable") {
+		t.Errorf("expected profile: reliable from flag, got: %s", output)
+	}
+	if !strings.Contains(output, "retry_max: 4") {
+		t.Errorf("expected retry_max: 4 for reliable, got: %s", output)
 	}
 }

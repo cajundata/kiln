@@ -24,6 +24,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// version is set at build time via ldflags. Defaults to "dev" for untagged builds.
+var version = "dev"
+
 // timeoutError is returned when the claude process exceeds the configured timeout.
 type timeoutError struct {
 	taskID  string
@@ -369,6 +372,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "version":
+		fmt.Fprintln(stdout, version)
+		return 0
 	case "exec":
 		code, err := runExec(args[1:], stdout)
 		if err != nil {
@@ -395,7 +401,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	case "gen-make":
-		if err := runGenMake(args[1:]); err != nil {
+		if err := runGenMake(args[1:], stdout); err != nil {
 			fmt.Fprintf(stderr, "gen-make: %v\n", err)
 			return 1
 		}
@@ -460,6 +466,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "verify-plan: %v\n", err)
 		}
 		return code
+	case "init":
+		if err := runInit(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "init: %v\n", err)
+			return 1
+		}
+		return 0
+	case "profile":
+		if err := runProfile(args[1:], stdout); err != nil {
+			fmt.Fprintf(stderr, "profile: %v\n", err)
+			return 1
+		}
+		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1
@@ -777,11 +795,13 @@ func runPlan(args []string, stdout io.Writer) error {
 	return nil
 }
 
-func runGenMake(args []string) error {
+func runGenMake(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("gen-make", flag.ContinueOnError)
 	tasksFile := fs.String("tasks", "", "path to tasks.yaml")
 	outFile := fs.String("out", "", "output path for targets.mk")
 	devPhase := fs.Int("dev-phase", 0, "filter tasks to a specific dev-phase (0 = all)")
+	format := fs.String("format", "text", "output format: text or json")
+	profileFlag := fs.String("profile", "", "workflow profile: speed or reliable (overrides .kiln/config.yaml)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -793,10 +813,19 @@ func runGenMake(args []string) error {
 	if *outFile == "" {
 		return fmt.Errorf("--out is required")
 	}
+	if *format != "text" && *format != "json" {
+		return fmt.Errorf("invalid --format value %q: must be text or json", *format)
+	}
 
 	tasks, err := loadTasks(*tasksFile)
 	if err != nil {
 		return err
+	}
+
+	// Load workflow profile for parallelism_limit.
+	profile, profileErr := loadProfile(".kiln/config.yaml", *profileFlag)
+	if profileErr != nil {
+		return fmt.Errorf("failed to load profile: %w", profileErr)
 	}
 
 	if *devPhase > 0 {
@@ -813,6 +842,13 @@ func runGenMake(args []string) error {
 	}
 
 	var buf bytes.Buffer
+
+	// Emit parallelism cap from profile if parallelism_limit > 0.
+	// parallelism_limit = 0 means unlimited (no directive emitted).
+	if profile.ParallelismLimit > 0 {
+		fmt.Fprintf(&buf, "# Parallelism cap from profile (parallelism_limit=%d)\n", profile.ParallelismLimit)
+		fmt.Fprintf(&buf, "MAKEFLAGS += -j%d\n\n", profile.ParallelismLimit)
+	}
 
 	// Collect all done targets
 	var allDone []string
@@ -901,6 +937,38 @@ func runGenMake(args []string) error {
 
 	if err := os.WriteFile(*outFile, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("failed to write output file: %w", err)
+	}
+
+	if *format == "json" {
+		type genMakeTargetInfo struct {
+			TaskID    string   `json:"task_id"`
+			Target    string   `json:"target"`
+			DependsOn []string `json:"depends_on"`
+		}
+		type genMakeJSONResult struct {
+			TasksCount int                 `json:"tasks_count"`
+			OutputFile string              `json:"output_file"`
+			Targets    []genMakeTargetInfo `json:"targets"`
+		}
+		targets := make([]genMakeTargetInfo, 0, len(tasks))
+		for _, t := range tasks {
+			deps := make([]string, 0, len(t.Needs))
+			for _, dep := range t.Needs {
+				deps = append(deps, ".kiln/done/"+dep+".done")
+			}
+			targets = append(targets, genMakeTargetInfo{
+				TaskID:    t.ID,
+				Target:    ".kiln/done/" + t.ID + ".done",
+				DependsOn: deps,
+			})
+		}
+		result := genMakeJSONResult{
+			TasksCount: len(tasks),
+			OutputFile: *outFile,
+			Targets:    targets,
+		}
+		data, _ := json.Marshal(result)
+		fmt.Fprintln(stdout, string(data))
 	}
 
 	return nil
@@ -1220,6 +1288,12 @@ var commandBuilder = func(ctx context.Context, prompt, model string) *exec.Cmd {
 // sleepFn is used to sleep between retry attempts. Swappable in tests.
 var sleepFn = time.Sleep
 
+// execProgressWriter is the writer used for claude process output and warning messages
+// in kiln exec --format json mode. When non-nil, it overrides the stdout writer for
+// progress/warnings so that stdout carries only the final JSON result.
+// Defaults to nil (use the caller-provided stdout). Override in tests to capture output.
+var execProgressWriter io.Writer
+
 func runGenPrompts(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("gen-prompts", flag.ContinueOnError)
 	tasksFile := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml")
@@ -1326,13 +1400,83 @@ type ProjectDefaults struct {
 	Verify []VerifyGate `yaml:"verify,omitempty"`
 }
 
+// =============================================================================
+// --- Profile system ---
+// =============================================================================
+
+// Profile defines workflow defaults for speed vs reliability tradeoffs.
+// These are compiled-in defaults; individual flag values and task settings
+// take precedence over profile defaults.
+type Profile struct {
+	// RequireUnify, if true, means UNIFY closure must be generated before marking a task complete.
+	// Forward-compatible: auto-enforcement in kiln exec is not yet implemented.
+	// When true and UNIFY enforcement is absent, a debug message is logged and execution proceeds.
+	RequireUnify bool
+	// RequireVerifyGates, if true, means verify gates must pass before the .done marker is written.
+	// Forward-compatible: full enforcement semantics may evolve; current behavior always enforces
+	// configured gates regardless of this setting.
+	RequireVerifyGates bool
+	// ParallelismLimit, if > 0, caps the number of Make jobs via MAKEFLAGS in targets.mk.
+	// 0 means unlimited (deferring to Make's -jN flag).
+	// This value is consumed by gen-make, not by exec.
+	ParallelismLimit int
+	// RetryMax is the default number of additional retry attempts on retryable failures.
+	RetryMax int
+	// RetryBackoffBase is the default base duration for backoff between retry attempts.
+	RetryBackoffBase time.Duration
+}
+
+// Known workflow profile name constants.
+const (
+	WorkflowProfileSpeed    = "speed"
+	WorkflowProfileReliable = "reliable"
+)
+
+// speedProfile is the default workflow profile, optimized for fast iteration.
+var speedProfile = Profile{
+	RequireUnify:       false,
+	RequireVerifyGates: false,
+	ParallelismLimit:   0,
+	RetryMax:           2,
+	RetryBackoffBase:   5 * time.Second,
+}
+
+// reliableProfile is the conservative workflow profile, optimized for correctness.
+var reliableProfile = Profile{
+	RequireUnify:       true,
+	RequireVerifyGates: true,
+	ParallelismLimit:   2,
+	RetryMax:           4,
+	RetryBackoffBase:   10 * time.Second,
+}
+
+// workflowProfiles is the registry of built-in workflow profiles.
+var workflowProfiles = map[string]Profile{
+	WorkflowProfileSpeed:    speedProfile,
+	WorkflowProfileReliable: reliableProfile,
+}
+
+// kilnConfigOverrides allows overriding individual profile settings in .kiln/config.yaml.
+// Only the fields listed here are valid override keys; unknown keys produce a parse error
+// when using strict YAML decoding.
+type kilnConfigOverrides struct {
+	RequireUnify       *bool   `yaml:"require_unify,omitempty"`
+	RequireVerifyGates *bool   `yaml:"require_verify_gates,omitempty"`
+	ParallelismLimit   *int    `yaml:"parallelism_limit,omitempty"`
+	RetryMax           *int    `yaml:"retry_max,omitempty"`
+	RetryBackoffBase   *string `yaml:"retry_backoff_base,omitempty"`
+}
+
 // ProjectConfig holds project-wide configuration loaded from .kiln/config.yaml.
 type ProjectConfig struct {
-	Defaults ProjectDefaults `yaml:"defaults"`
+	Defaults  ProjectDefaults     `yaml:"defaults"`
+	Profile   string              `yaml:"profile,omitempty"`
+	Overrides kilnConfigOverrides `yaml:"overrides,omitempty"`
 }
 
 // loadProjectConfig reads path and returns the parsed config.
 // Returns an empty config (not an error) if the file does not exist.
+// Unknown top-level fields and unknown override fields produce a validation error.
 func loadProjectConfig(path string) (ProjectConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1343,6 +1487,7 @@ func loadProjectConfig(path string) (ProjectConfig, error) {
 	}
 	var cfg ProjectConfig
 	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true) // reject unknown fields (including unknown override keys)
 	if err := dec.Decode(&cfg); err != nil {
 		if err == io.EOF {
 			return ProjectConfig{}, nil // empty file is fine
@@ -1350,6 +1495,53 @@ func loadProjectConfig(path string) (ProjectConfig, error) {
 		return ProjectConfig{}, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	return cfg, nil
+}
+
+// loadProfile reads .kiln/config.yaml and returns the active Profile.
+// If the file does not exist, the speed profile is returned without error.
+// profileOverride, if non-empty, takes precedence over the config file's profile field.
+func loadProfile(configPath string, profileOverride string) (*Profile, error) {
+	cfg, err := loadProjectConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine effective profile name: flag > config > default.
+	profileName := cfg.Profile
+	if profileOverride != "" {
+		profileName = profileOverride
+	}
+	if profileName == "" {
+		profileName = WorkflowProfileSpeed
+	}
+
+	base, ok := workflowProfiles[profileName]
+	if !ok {
+		return nil, fmt.Errorf("unknown profile %q; known profiles: speed, reliable", profileName)
+	}
+
+	// Apply overrides on top of the base profile.
+	if cfg.Overrides.RequireUnify != nil {
+		base.RequireUnify = *cfg.Overrides.RequireUnify
+	}
+	if cfg.Overrides.RequireVerifyGates != nil {
+		base.RequireVerifyGates = *cfg.Overrides.RequireVerifyGates
+	}
+	if cfg.Overrides.ParallelismLimit != nil {
+		base.ParallelismLimit = *cfg.Overrides.ParallelismLimit
+	}
+	if cfg.Overrides.RetryMax != nil {
+		base.RetryMax = *cfg.Overrides.RetryMax
+	}
+	if cfg.Overrides.RetryBackoffBase != nil {
+		dur, parseErr := time.ParseDuration(*cfg.Overrides.RetryBackoffBase)
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid overrides.retry_backoff_base %q: %w", *cfg.Overrides.RetryBackoffBase, parseErr)
+		}
+		base.RetryBackoffBase = dur
+	}
+
+	return &base, nil
 }
 
 // mergeGates computes the final gate list by merging project defaults with task-level gates.
@@ -1475,6 +1667,45 @@ func computeBackoff(strategy string, base time.Duration, attempt int) time.Durat
 	return delay
 }
 
+// execJSONResult is the JSON output schema for kiln exec --format json.
+type execJSONResult struct {
+	TaskID      string              `json:"task_id"`
+	Status      string              `json:"status"`
+	ExitCode    int                 `json:"exit_code"`
+	Model       string              `json:"model"`
+	PromptFile  string              `json:"prompt_file"`
+	StartedAt   string              `json:"started_at"`
+	EndedAt     string              `json:"ended_at"`
+	DurationMs  int64               `json:"duration_ms"`
+	Attempts    int                 `json:"attempts"`
+	Footer      *kilnFooterEnvelope `json:"footer"`
+	FooterValid bool                `json:"footer_valid"`
+	Error       *string             `json:"error"`
+}
+
+// writeExecJSONResult marshals and writes an execJSONResult to w as a single compact JSON line.
+func writeExecJSONResult(w io.Writer, log execRunLog, attempts int, execErr error) {
+	result := execJSONResult{
+		TaskID:      log.TaskID,
+		Status:      log.Status,
+		ExitCode:    log.ExitCode,
+		Model:       log.Model,
+		PromptFile:  log.PromptFile,
+		StartedAt:   log.StartedAt.UTC().Format(time.RFC3339),
+		EndedAt:     log.EndedAt.UTC().Format(time.RFC3339),
+		DurationMs:  log.DurationMs,
+		Attempts:    attempts,
+		Footer:      log.Footer,
+		FooterValid: log.FooterValid,
+	}
+	if execErr != nil {
+		msg := execErr.Error()
+		result.Error = &msg
+	}
+	data, _ := json.Marshal(result)
+	fmt.Fprintln(w, string(data))
+}
+
 func runExec(args []string, stdout io.Writer) (int, error) {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 
@@ -1483,20 +1714,49 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	tasksFlag := fs.String("tasks", ".kiln/tasks.yaml", "path to tasks.yaml (resolves prompt and model from task definition)")
 	modelFlag := fs.String("model", "", "claude model to use (overrides KILN_MODEL env var)")
 	timeoutStr := fs.String("timeout", "60m", "maximum duration for the claude invocation")
-	retriesFlag := fs.Int("retries", 0, "number of additional attempts on retryable failures")
-	retryBackoffStr := fs.String("retry-backoff", "0s", "sleep duration between retry attempts")
+	retriesFlag := fs.Int("retries", 0, "number of additional attempts on retryable failures (default from profile)")
+	retryBackoffStr := fs.String("retry-backoff", "0s", "sleep duration between retry attempts (default from profile)")
 	backoffFlag := fs.String("backoff", "fixed", "backoff strategy between retries: fixed or exponential")
 	forceUnlock := fs.Bool("force-unlock", false, "remove existing lock file before acquiring (for stale locks)")
 	skipVerify := fs.Bool("skip-verify", false, "skip all verify gates (useful for debugging; logs a warning)")
 	noChain := fs.Bool("no-chain", false, "disable prompt chaining (skip dependency context injection)")
 	maxContextBytes := fs.Int("max-context-bytes", 50000, "maximum bytes of injected dependency context (~50KB default)")
+	profileFlag := fs.String("profile", "", "workflow profile: speed or reliable (overrides .kiln/config.yaml)")
+	formatFlag := fs.String("format", "text", "output format: text or json")
 
 	if err := fs.Parse(args); err != nil {
 		return 0, err
 	}
 
+	// Track which flags were explicitly set by the user (for profile default precedence).
+	retriesExplicit := false
+	retryBackoffExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "retries":
+			retriesExplicit = true
+		case "retry-backoff":
+			retryBackoffExplicit = true
+		}
+	})
+
 	if *taskID == "" {
 		return 0, fmt.Errorf("--task-id is required")
+	}
+
+	if *formatFlag != "text" && *formatFlag != "json" {
+		return 0, fmt.Errorf("invalid --format value %q: must be text or json", *formatFlag)
+	}
+
+	// Determine the writer for progress output (claude process output, warnings).
+	// In json mode, progress goes to stderr so stdout carries only the final JSON result.
+	progressOut := io.Writer(stdout)
+	if *formatFlag == "json" {
+		if execProgressWriter != nil {
+			progressOut = execProgressWriter
+		} else {
+			progressOut = os.Stderr
+		}
 	}
 
 	// Acquire task-level lock to prevent concurrent execution of the same task.
@@ -1504,7 +1764,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	if *forceUnlock {
 		lockPath := filepath.Join(locksDir, *taskID+".lock")
 		if _, statErr := os.Stat(lockPath); statErr == nil {
-			fmt.Fprintf(stdout, "warning: force-unlocking stale lock for task %s\n", *taskID)
+			fmt.Fprintf(progressOut, "warning: force-unlocking stale lock for task %s\n", *taskID)
 			_ = os.Remove(lockPath)
 		}
 	}
@@ -1583,11 +1843,6 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		return 0, fmt.Errorf("invalid --timeout value: %w", err)
 	}
 
-	retryBackoff, err := time.ParseDuration(*retryBackoffStr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid --retry-backoff value: %w", err)
-	}
-
 	if *backoffFlag != "fixed" && *backoffFlag != "exponential" {
 		return 0, fmt.Errorf("invalid --backoff value %q: must be fixed or exponential", *backoffFlag)
 	}
@@ -1607,14 +1862,61 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	// Load project-wide config (best-effort; ignore errors and proceed with no defaults).
 	projectCfg, cfgErr := loadProjectConfig(".kiln/config.yaml")
 	if cfgErr != nil {
-		fmt.Fprintf(stdout, "warning: failed to load .kiln/config.yaml: %v\n", cfgErr)
+		fmt.Fprintf(progressOut, "warning: failed to load .kiln/config.yaml: %v\n", cfgErr)
 	}
 
+	// Determine if a profile was explicitly configured (--profile flag or config file).
+	// Profile retry defaults only apply when explicitly configured; otherwise defaults
+	// remain at 0 for backward compatibility.
+	profileExplicit := *profileFlag != "" || projectCfg.Profile != ""
+
+	// Load workflow profile for settings (RequireUnify, parallelism, retry defaults).
+	// Errors here are non-fatal (fall back to speed profile).
+	profile, profileErr := loadProfile(".kiln/config.yaml", *profileFlag)
+	if profileErr != nil {
+		fmt.Fprintf(progressOut, "warning: failed to load profile: %v; using speed defaults\n", profileErr)
+		p := speedProfile
+		profile = &p
+	}
+
+	// Log forward-compatible profile features that are not yet enforced.
+	if profile.RequireUnify {
+		fmt.Fprintf(progressOut, "debug: profile requires UNIFY but UNIFY enforcement in exec is not yet implemented; skipping\n")
+	}
+	// require_verify_gates is forward-compatible; current behavior always enforces configured gates.
+
 	model := resolveModel(*modelFlag, taskModel)
-	retries := *retriesFlag
+
+	// Compute effective retries: explicit flag > task-level > profile (if explicitly configured) > 0.
+	retries := 0
+	retriesFromProfile := false
+	if profileExplicit {
+		retries = profile.RetryMax
+		retriesFromProfile = true
+	}
 	if taskRetries > 0 {
 		retries = taskRetries
+		retriesFromProfile = false
 	}
+	if retriesExplicit {
+		retries = *retriesFlag
+		retriesFromProfile = false
+	}
+
+	// Compute effective backoff: explicit flag > profile (when retries from profile) > 0s.
+	// When retries come from explicit flag or task field, default backoff is 0s for
+	// backward compatibility. Profile backoff only applies when retries also come from profile.
+	retryBackoff, err := time.ParseDuration(*retryBackoffStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --retry-backoff value: %w", err)
+	}
+	var effectiveBackoff time.Duration
+	if retryBackoffExplicit {
+		effectiveBackoff = retryBackoff
+	} else if retriesFromProfile {
+		effectiveBackoff = profile.RetryBackoffBase
+	}
+
 	maxAttempts := 1 + retries
 	logDir := ".kiln/logs"
 	stateFile := ".kiln/state.json"
@@ -1622,7 +1924,7 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 	// Load state before execution; ignore errors (treat as empty state).
 	state, stateErr := loadState(stateFile)
 	if stateErr != nil {
-		fmt.Fprintf(stdout, "warning: failed to load state: %v\n", stateErr)
+		fmt.Fprintf(progressOut, "warning: failed to load state: %v\n", stateErr)
 		state = &StateManifest{Tasks: make(map[string]*TaskState)}
 	}
 	if state.Tasks[*taskID] == nil {
@@ -1632,37 +1934,49 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 
 	var lastErr error
 	var lastLog execRunLog
+	var totalAttempts int
+
+	// emitIfJSON writes the final JSON result to stdout when --format json is active.
+	emitIfJSON := func(log execRunLog, attempts int, execErr error) {
+		if *formatFlag == "json" {
+			writeExecJSONResult(stdout, log, attempts, execErr)
+		}
+	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		totalAttempts = attempt
 		// Update state to "running" before each attempt.
 		ts.Status = "running"
 		ts.Attempts++
 		ts.LastAttemptAt = time.Now()
 		if saveErr := saveState(stateFile, state); saveErr != nil {
-			fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+			fmt.Fprintf(progressOut, "warning: failed to save state: %v\n", saveErr)
 		}
 
-		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, stdout, taskEnv)
+		log, err := execOnce(*taskID, prompt, model, *promptFile, timeout, progressOut, taskEnv)
+		lastLog = log
 
 		// For successful completions, run verify gates before writing the log.
 		if err == nil && log.FooterValid {
 			finalGates := mergeGates(projectCfg.Defaults.Verify, taskVerify, taskVerifyLoaded)
 			if *skipVerify && len(finalGates) > 0 {
-				fmt.Fprintf(stdout, "warning: --skip-verify is set; skipping %d verify gate(s) for task %s\n", len(finalGates), *taskID)
+				fmt.Fprintf(progressOut, "warning: --skip-verify is set; skipping %d verify gate(s) for task %s\n", len(finalGates), *taskID)
 				log.Verify = &verifyResults{Skipped: true, AllPassed: true, Gates: nil}
+				lastLog = log
 			} else if len(finalGates) > 0 {
 				gateRes, gateErr := runVerifyGates(finalGates, *taskID, "", defaultVerifyGateTimeout)
 				allPassed := gateErr == nil
 				log.Verify = &verifyResults{Gates: gateRes, AllPassed: allPassed, Skipped: false}
+				lastLog = log
 				if !allPassed {
-					fmt.Fprintf(stdout, "verify: gate failure for task %s: %v\n", *taskID, gateErr)
+					fmt.Fprintf(progressOut, "verify: gate failure for task %s: %v\n", *taskID, gateErr)
 				}
 			}
 		}
 
 		// Always write the log, even on error (now includes verify results for successes).
 		if writeErr := writeExecLog(logDir, *taskID, log); writeErr != nil {
-			fmt.Fprintf(stdout, "warning: failed to write exec log: %v\n", writeErr)
+			fmt.Fprintf(progressOut, "warning: failed to write exec log: %v\n", writeErr)
 		}
 
 		if err == nil {
@@ -1674,8 +1988,9 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 					ts.DurationMs = log.DurationMs
 					ts.Model = log.Model
 					if saveErr := saveState(stateFile, state); saveErr != nil {
-						fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+						fmt.Fprintf(progressOut, "warning: failed to save state: %v\n", saveErr)
 					}
+					emitIfJSON(lastLog, totalAttempts, nil)
 					return 2, nil
 				}
 				// Task completed and all verify gates passed (or no gates, or skipped).
@@ -1689,13 +2004,14 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 					ts.Notes = log.Footer.Kiln.Notes
 				}
 				if saveErr := saveState(stateFile, state); saveErr != nil {
-					fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+					fmt.Fprintf(progressOut, "warning: failed to save state: %v\n", saveErr)
 				}
 				doneDir := ".kiln/done"
 				if mkErr := os.MkdirAll(doneDir, 0o755); mkErr == nil {
 					donePath := filepath.Join(doneDir, *taskID+".done")
 					os.WriteFile(donePath, nil, 0o644)
 				}
+				emitIfJSON(lastLog, totalAttempts, nil)
 				return 2, nil
 			}
 			// not_complete or blocked.
@@ -1707,13 +2023,13 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 			ts.DurationMs = log.DurationMs
 			ts.Model = log.Model
 			if saveErr := saveState(stateFile, state); saveErr != nil {
-				fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+				fmt.Fprintf(progressOut, "warning: failed to save state: %v\n", saveErr)
 			}
+			emitIfJSON(lastLog, totalAttempts, nil)
 			return 0, nil
 		}
 
 		lastErr = err
-		lastLog = log
 
 		// Update state to "failed" after an error attempt.
 		ts.Status = "failed"
@@ -1721,18 +2037,20 @@ func runExec(args []string, stdout io.Writer) (int, error) {
 		errClass, _ := classify(err)
 		ts.LastErrorClass = errClass
 		if saveErr := saveState(stateFile, state); saveErr != nil {
-			fmt.Fprintf(stdout, "warning: failed to save state: %v\n", saveErr)
+			fmt.Fprintf(progressOut, "warning: failed to save state: %v\n", saveErr)
 		}
 
 		if !isRetryable(err) {
+			emitIfJSON(lastLog, totalAttempts, lastErr)
 			return lastLog.ExitCode, lastErr
 		}
 
-		if attempt < maxAttempts && retryBackoff > 0 {
-			sleepFn(computeBackoff(*backoffFlag, retryBackoff, attempt))
+		if attempt < maxAttempts && effectiveBackoff > 0 {
+			sleepFn(computeBackoff(*backoffFlag, effectiveBackoff, attempt))
 		}
 	}
 
+	emitIfJSON(lastLog, totalAttempts, lastErr)
 	return lastLog.ExitCode, lastErr
 }
 
@@ -2875,4 +3193,325 @@ func printVerifyPlanReport(stdout io.Writer, format string, result verifyPlanRes
 	} else {
 		fmt.Fprintf(stdout, "%d issue(s) found\n", errorCount)
 	}
+}
+
+// =============================================================================
+// --- init subcommand ---
+// =============================================================================
+
+// validProfiles is the set of allowed --profile values for kiln init.
+var validProfiles = map[string]bool{
+	"go":      true,
+	"python":  true,
+	"node":    true,
+	"generic": true,
+}
+
+// initScaffoldFile represents a file to be written during kiln init.
+type initScaffoldFile struct {
+	path    string
+	content string
+}
+
+// runInit implements the `kiln init` subcommand.
+// It scaffolds a complete .kiln/ directory structure and supporting files.
+func runInit(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	profile := fs.String("profile", "generic", "project profile: go, python, node, generic")
+	force := fs.Bool("force", false, "overwrite existing files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if !validProfiles[*profile] {
+		return fmt.Errorf("invalid profile %q: must be one of go, python, node, generic", *profile)
+	}
+
+	// Determine base directory (current working directory).
+	baseDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to determine working directory: %w", err)
+	}
+
+	return runInitInDir(baseDir, *profile, *force, stdout)
+}
+
+// runInitInDir performs the actual scaffolding in the given base directory.
+// Separated for testability.
+func runInitInDir(baseDir, profile string, force bool, stdout io.Writer) error {
+	// Directories to create.
+	dirs := []string{
+		filepath.Join(baseDir, ".kiln"),
+		filepath.Join(baseDir, ".kiln", "prompts", "tasks"),
+		filepath.Join(baseDir, ".kiln", "logs"),
+		filepath.Join(baseDir, ".kiln", "done"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", d, err)
+		}
+	}
+
+	// Files to scaffold.
+	files := []initScaffoldFile{
+		{
+			path:    filepath.Join(baseDir, ".kiln", "tasks.yaml"),
+			content: initTasksYAML(),
+		},
+		{
+			path:    filepath.Join(baseDir, ".kiln", "prompts", "tasks", "hello-world.md"),
+			content: initHelloWorldPrompt(profile),
+		},
+		{
+			path:    filepath.Join(baseDir, ".kiln", "prompts", "tasks", "follow-up.md"),
+			content: initFollowUpPrompt(profile),
+		},
+		{
+			path:    filepath.Join(baseDir, "Makefile"),
+			content: initMakefile(profile),
+		},
+		{
+			path:    filepath.Join(baseDir, "PRD.md"),
+			content: initPRD(),
+		},
+	}
+
+	var created, skipped []string
+	for _, f := range files {
+		if !force {
+			if _, err := os.Stat(f.path); err == nil {
+				skipped = append(skipped, f.path)
+				continue
+			}
+		}
+		if err := os.WriteFile(f.path, []byte(f.content), 0o644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", f.path, err)
+		}
+		created = append(created, f.path)
+	}
+
+	// Print summary.
+	for _, p := range created {
+		fmt.Fprintf(stdout, "created: %s\n", p)
+	}
+	for _, p := range skipped {
+		fmt.Fprintf(stdout, "skipped: %s (already exists; use --force to overwrite)\n", p)
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Next steps:")
+	fmt.Fprintln(stdout, "  1. Edit PRD.md to describe your project goals and tasks.")
+	fmt.Fprintln(stdout, "  2. Run `make plan` to generate .kiln/tasks.yaml from your PRD.")
+	fmt.Fprintln(stdout, "  3. Run `make all` to execute all tasks.")
+
+	return nil
+}
+
+// initTasksYAML returns the starter tasks.yaml content.
+func initTasksYAML() string {
+	return `# tasks.yaml — Kiln task graph
+#
+# Each task has the following fields:
+#   id:      (required) Unique kebab-case identifier for the task.
+#   prompt:  (required) Path to the prompt file for this task.
+#   needs:   (optional) List of task IDs that must complete before this task runs.
+#   timeout: (optional) Maximum duration for the task (e.g. "15m", "1h"). Default: 15m.
+#
+# Tasks are executed by kiln exec and orchestrated by Make via kiln gen-make.
+
+- id: hello-world
+  prompt: .kiln/prompts/tasks/hello-world.md
+  needs: []
+
+- id: follow-up
+  prompt: .kiln/prompts/tasks/follow-up.md
+  needs:
+    - hello-world
+`
+}
+
+// initHelloWorldPrompt returns the starter hello-world prompt content for the given profile.
+func initHelloWorldPrompt(profile string) string {
+	var langInstruction string
+	switch profile {
+	case "go":
+		langInstruction = "Create a file named `hello.go` in the project root that prints \"Hello, World!\" when run with `go run hello.go`."
+	case "python":
+		langInstruction = "Create a file named `hello.py` in the project root that prints \"Hello, World!\" when run with `python hello.py`."
+	case "node":
+		langInstruction = "Create a file named `hello.js` in the project root that prints \"Hello, World!\" when run with `node hello.js`."
+	default:
+		langInstruction = "Create a file named `hello.txt` in the project root containing the text \"Hello, World!\"."
+	}
+
+	return fmt.Sprintf(`# Task: hello-world
+
+%s
+
+When you are done, output the following JSON footer as the very last line of your response:
+
+{"kiln":{"status":"complete","task_id":"hello-world"}}
+
+If you cannot complete the task, use:
+
+{"kiln":{"status":"not_complete","task_id":"hello-world"}}
+`, langInstruction)
+}
+
+// initFollowUpPrompt returns the starter follow-up prompt content for the given profile.
+func initFollowUpPrompt(profile string) string {
+	var fileName string
+	switch profile {
+	case "go":
+		fileName = "hello.go"
+	case "python":
+		fileName = "hello.py"
+	case "node":
+		fileName = "hello.js"
+	default:
+		fileName = "hello.txt"
+	}
+
+	return fmt.Sprintf(`# Task: follow-up
+
+Verify that the file %s exists in the project root.
+If it exists, add a comment at the top of the file explaining what it does.
+If it does not exist, report that it is missing.
+
+When you are done, output the following JSON footer as the very last line of your response:
+
+{"kiln":{"status":"complete","task_id":"follow-up"}}
+
+If you cannot complete the task, use:
+
+{"kiln":{"status":"not_complete","task_id":"follow-up"}}
+`, fileName)
+}
+
+// initMakefile returns the starter Makefile content for the given profile.
+func initMakefile(profile string) string {
+	var profileTargets string
+	switch profile {
+	case "go":
+		profileTargets = `
+build:
+	go build ./...
+
+test:
+	go test ./...
+`
+	case "python":
+		profileTargets = `
+test:
+	pytest
+`
+	case "node":
+		profileTargets = `
+test:
+	npm test
+`
+	default:
+		profileTargets = ""
+	}
+
+	return fmt.Sprintf(`# Makefile — Kiln project
+#
+# Workflow:
+#   make plan   — (manual step) Edit PRD.md then run kiln/claude to generate tasks.yaml
+#   make graph  — Generate .kiln/targets.mk from .kiln/tasks.yaml
+#   make all    — Run all tasks in the dependency graph
+
+-include .kiln/targets.mk
+
+.PHONY: plan graph all
+
+# plan: Placeholder — edit PRD.md and use your preferred method to generate .kiln/tasks.yaml.
+plan:
+	@echo "Edit PRD.md to describe your project, then run kiln gen-make to generate targets."
+
+# graph: Regenerate Make targets from .kiln/tasks.yaml.
+graph:
+	kiln gen-make
+
+# all: Run graph first, then execute all generated targets.
+all: graph
+	$(MAKE) -f .kiln/targets.mk
+%s`, profileTargets)
+}
+
+// initPRD returns the starter PRD.md content.
+func initPRD() string {
+	return `# Project Requirements Document (PRD)
+
+## Project Name
+
+<!-- Replace with your project name -->
+My Project
+
+## Goals
+
+<!-- Describe what this project aims to accomplish -->
+- Goal 1: ...
+- Goal 2: ...
+- Goal 3: ...
+
+## Tasks
+
+<!-- Describe the discrete tasks that need to be implemented.
+     Each task here should correspond to an entry in .kiln/tasks.yaml.
+     Tasks can depend on each other — list dependencies explicitly. -->
+
+### Task: hello-world
+- **Goal:** Create a hello-world entry point for the project.
+- **Depends on:** (none)
+
+### Task: follow-up
+- **Goal:** Verify and annotate the hello-world file.
+- **Depends on:** hello-world
+
+## Acceptance Criteria
+
+<!-- List the conditions that must be true for this project to be considered complete -->
+- [ ] All tasks complete successfully
+- [ ] All verify gates pass
+`
+}
+
+// =============================================================================
+// --- profile subcommand ---
+// =============================================================================
+
+// runProfile implements the `kiln profile` subcommand.
+// It prints the active profile name and its resolved settings (after overrides).
+func runProfile(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("profile", flag.ContinueOnError)
+	profileFlag := fs.String("profile", "", "workflow profile override: speed or reliable")
+	configFlag := fs.String("config", ".kiln/config.yaml", "path to config.yaml")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	p, err := loadProfile(*configFlag, *profileFlag)
+	if err != nil {
+		return err
+	}
+
+	// Determine the active profile name for display.
+	profileName := *profileFlag
+	if profileName == "" {
+		cfg, cfgErr := loadProjectConfig(*configFlag)
+		if cfgErr == nil && cfg.Profile != "" {
+			profileName = cfg.Profile
+		} else {
+			profileName = WorkflowProfileSpeed
+		}
+	}
+
+	fmt.Fprintf(stdout, "profile: %s\n", profileName)
+	fmt.Fprintf(stdout, "require_unify: %v\n", p.RequireUnify)
+	fmt.Fprintf(stdout, "require_verify_gates: %v\n", p.RequireVerifyGates)
+	fmt.Fprintf(stdout, "parallelism_limit: %d\n", p.ParallelismLimit)
+	fmt.Fprintf(stdout, "retry_max: %d\n", p.RetryMax)
+	fmt.Fprintf(stdout, "retry_backoff_base: %s\n", p.RetryBackoffBase)
+	return nil
 }

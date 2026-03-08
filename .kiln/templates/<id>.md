@@ -7,7 +7,7 @@ SCOPE
 Implement ONLY the work required for this task. Do not work on other tasks in the PRD, even if you notice related issues.
 
 CONTEXT
-- This project uses the AgentRun workflow to reduce context rot.
+- This project uses the Kiln workflow to reduce context rot.
 - You are executing a single task in isolation. Assume other tasks may not be done yet unless you can confirm in the repo.
 
 REQUIREMENTS

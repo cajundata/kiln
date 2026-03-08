@@ -6,10 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Kiln is a Go CLI tool that prevents Claude Code context rot by running one task per fresh invocation, orchestrated by Make for dependency resolution and parallel execution. It implements the "Ralph Wiggum" pattern: PRD → tasks.yaml → generated Make targets → executed tasks with timeouts, retries, and structured logging.
 
+## Versioning
+
+Kiln uses `ldflags` + git tags for version injection. The `version` variable in `main.go` defaults to `"dev"` and is overridden at build time by the Makefile using `git describe --tags --always --dirty`.
+
+- Tag releases with semver: `git tag v0.1.0`
+- `kiln version` prints the current version string
+- Building via `make` automatically injects the version; `go build` without ldflags produces `"dev"`
+
 ## Build & Test
 
 ```bash
-# Build
+# Build (with version injection)
+make bin/kiln
+
+# Build (without version — prints "dev")
 go build -o kiln ./cmd/kiln
 
 # Run all tests

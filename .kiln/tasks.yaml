@@ -56,13 +56,13 @@
 
 - id: interactive-tui
   prompt: .kiln/prompts/tasks/interactive-tui.md
-  dev-phase: 4
+  dev-phase: 5
   needs:
     - state-resumability
 
 - id: git-automation
   prompt: .kiln/prompts/tasks/git-automation.md
-  dev-phase: 5
+  dev-phase: 7
   needs: []
 
 - id: verify-plan
@@ -82,6 +82,11 @@
 
 - id: engine-abstraction
   prompt: .kiln/prompts/tasks/engine-abstraction.md
-  dev-phase: 5
+  dev-phase: 9
   needs:
     - richer-schema
+
+- id: create-guide
+  prompt: .kiln/prompts/tasks/create-guide.md
+  timeout: 90m
+  needs: []

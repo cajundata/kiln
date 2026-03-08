@@ -5,9 +5,11 @@ TASKS_FILE := .kiln/tasks.yaml
 TARGETS_FILE := .kiln/targets.mk
 
 # ---- Auto-build binary when source changes ----
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 $(KILN): cmd/kiln/main.go
-	@echo "kiln: rebuilding $(KILN)..."
-	@go build -o $(KILN) ./cmd/kiln
+	@echo "kiln: rebuilding $(KILN) ($(VERSION))..."
+	@go build -ldflags "-X main.version=$(VERSION)" -o $(KILN) ./cmd/kiln
 	@echo "kiln: build complete"
 
 # ---- Generated targets (conditionally included) ----
