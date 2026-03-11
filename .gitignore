@@ -43,3 +43,6 @@ go.work.sum
 # Dev artificats
 state.json
 *.done
+
+# Binaries
+bin/
