@@ -34,34 +34,111 @@ For the full guide, read on.
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [Prerequisites](#2-prerequisites)
-3. [The .kiln/ Directory Layout](#3-the-kiln-directory-layout)
-4. [Launching the TUI](#4-launching-the-tui)
-5. [Multi-Terminal Layout Tips](#5-multi-terminal-layout-tips)
-6. [Walkthrough: New Project from Scratch](#6-walkthrough-new-project-from-scratch)
-7. [Walkthrough: Pre-Existing Project](#7-walkthrough-pre-existing-project)
-8. [The Main View (Task Graph)](#8-the-main-view-task-graph)
-9. [The Summary Panel](#9-the-summary-panel)
-10. [The Task Detail View](#10-the-task-detail-view)
-11. [The Log Events View](#11-the-log-events-view)
-12. [The Help Overlay](#12-the-help-overlay)
-13. [Grouping Tasks](#13-grouping-tasks)
-14. [Understanding Task Status](#14-understanding-task-status)
-15. [Error Classes and Retryability](#15-error-classes-and-retryability)
-16. [Exit Codes](#16-exit-codes)
-17. [Blocked Tasks and Dependencies](#17-blocked-tasks-and-dependencies)
-18. [Recovery Workflow: retry, reset, resume](#18-recovery-workflow-retry-reset-resume)
-19. [Polling and Live Refresh](#19-polling-and-live-refresh)
-20. [Models and Profiles](#20-models-and-profiles)
-21. [Anatomy of a tasks.yaml Entry](#21-anatomy-of-a-tasksyaml-entry)
-22. [Interpreting the Attempts Column](#22-interpreting-the-attempts-column)
-23. [Keyboard Reference](#23-keyboard-reference)
-24. [CLI Flags Reference](#24-cli-flags-reference)
-25. [Common Workflows](#25-common-workflows)
-26. [Companion Commands: status and report](#26-companion-commands-status-and-report)
-27. [Troubleshooting](#27-troubleshooting)
-28. [Glossary](#28-glossary)
+[[# Quick-Start Cheat Sheet]]
+[[# Table of Contents]]
+[[# 1. Overview]]
+- [[# When to use the TUI]]
+[[# 2. Prerequisites]]
+[[# 3. The .kiln/ Directory Layout]]
+- [[# How the TUI uses each file]]
+[[# 4. Launching the TUI]]
+[[# 5. Multi-Terminal Layout Tips]]
+- [[# tmux (recommended)]]
+- [[# Terminal emulator tabs/splits]]
+- [[# Layout suggestion]]
+[[# 6. Walkthrough: New Project from Scratch]]
+- [[# Step 1: Initialize the project]]
+- [[# Step 2: Write your PRD]]
+- [[# Step 3: Generate the task graph]]
+- [[# Step 4: Launch the TUI in one terminal]]
+- [[# Step 5: Start execution in a second terminal]]
+- [[# Step 6: Watch tasks progress in the TUI]]
+- [[# Step 7: Investigate failures]]
+- [[# Step 8: After execution completes]]
+[[# 7. Walkthrough: Pre-Existing Project]]
+- [[# Step 1: Check current state]]
+- [[# Step 2: Understand what's left]]
+- [[# Step 3: Resume execution]]
+- [[# Step 4: Use grouping for large projects]]
+[[# 8. The Main View (Task Graph)]]
+- [[# Summary Bar (top)]]
+- [[# Task Table (middle)]]
+- [[# Sort Order]]
+- [[# Keybinding Footer (bottom)]]
+[[# 9. The Summary Panel]]
+[[# 10. The Task Detail View]]
+- [[# What you'll see]]
+- [[# Navigation]]
+[[# 11. The Log Events View]]
+- [[# Scrolling]]
+- [[# Live updates]]
+[[# 12. The Help Overlay]]
+[[# 13. Grouping Tasks]]
+- [[# Group by Phase]]
+- [[# Group by Milestone]]
+- [[# Notes on grouping]]
+[[# 14. Understanding Task Status]]
+- [[# Priority order (highest to lowest)]]
+- [[# Status color reference]]
+[[# 15. Error Classes and Retryability]]
+- [[# Error class reference]]
+- [[# How retryability works]]
+[[# 16. Exit Codes]]
+- [[# Reading exit codes in the TUI]]
+[[# 17. Blocked Tasks and Dependencies]]
+- [[# In the main view]]
+- [[# In the detail view]]
+- [[# What to do about blocked tasks]]
+[[# 18. Recovery Workflow: retry, reset, resume]]
+- [[# Decision tree]]
+- [[# Command reference]]
+- [[# Watching recovery in the TUI]]
+[[# 19. Polling and Live Refresh]]
+- [[# What gets refreshed on each tick]]
+- [[# Configuring the refresh interval]]
+- [[# Force refresh]]
+- [[# Performance considerations]]
+[[# 20. Models and Profiles]]
+- [[# Model selection hierarchy]]
+- [[# Profiles: speed vs reliable]]
+- [[# What the TUI shows]]
+[[# 21. Anatomy of a tasks.yaml Entry]]
+- [[# Minimal entry]]
+- [[# Full entry with all optional fields]]
+- [[# Real-world example from this project]]
+- [[# How changes to tasks.yaml appear in the TUI]]
+[[# 22. Interpreting the Attempts Column]]
+- [[# Reading attempts + status together]]
+- [[# What drives the attempt count]]
+- [[# Examples from a real project]]
+- [[# When to worry]]
+[[# 23. Keyboard Reference]]
+- [[# Main View]]
+- [[# Detail View]]
+- [[# Log Events View]]
+- [[# Help Overlay]]
+[[# 24. CLI Flags Reference]]
+- [[# Examples]]
+[[# 25. Common Workflows]]
+- [[# Monitor a full build]]
+- [[# Investigate a failure]]
+- [[# Check progress after stepping away]]
+- [[# Run a specific dev-phase]]
+- [[# Batch retry all transient failures]]
+[[# 26. Companion Commands: status and report]]
+- [[# `kiln status` — One-shot task overview]]
+- [[# `kiln report` — Post-run analysis]]
+[[# 27. Troubleshooting]]
+- [[# TUI shows no tasks]]
+- [[# All tasks show as "pending" even though some completed]]
+- [[# Colors look wrong or missing]]
+- [[# TUI exits immediately]]
+- [[# Refresh feels sluggish]]
+- [[# Task status doesn't match what I expect]]
+- [[# A task shows "failed" but I fixed the code]]
+- [[# Lock conflict error]]
+- [[# Terminal is garbled after a crash]]
+[[# 28. Glossary]]
 
 ---
 
