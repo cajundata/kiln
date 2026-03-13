@@ -45,4 +45,5 @@ state.json
 *.done
 
 # Binaries
-bin/
+bin/*
+bin/kiln
