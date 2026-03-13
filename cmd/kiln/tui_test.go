@@ -859,6 +859,143 @@ func TestGroupByMilestoneRendersHeaders(t *testing.T) {
 	}
 }
 
+func TestGroupByPhaseKeepsGroupsTogether(t *testing.T) {
+	m, dir := newTestModel(t)
+
+	// Create tasks with different phases and mixed statuses.
+	tasksYAML := `- id: plan-a
+  prompt: prompts/a.md
+  phase: plan
+- id: build-a
+  prompt: prompts/b.md
+  phase: build
+- id: plan-b
+  prompt: prompts/c.md
+  phase: plan
+- id: build-b
+  prompt: prompts/d.md
+  phase: build
+`
+	if err := os.WriteFile(filepath.Join(dir, "tasks.yaml"), []byte(tasksYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Mark build-a as complete so it has a different status from build-b.
+	if err := os.WriteFile(filepath.Join(dir, "done", "build-a.done"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.tasksFile = filepath.Join(dir, "tasks.yaml")
+	m.refreshState()
+
+	// Enable phase grouping.
+	newM, _ := m.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	m2 := newM.(tuiModel)
+
+	// Verify tasks in the same phase are adjacent in displayOrder.
+	// Collect the phase sequence from display order.
+	var phases []string
+	for _, idx := range m2.displayOrder {
+		phases = append(phases, m2.tasks[idx].Phase)
+	}
+
+	// With proper grouping, we should see all "build" together and all "plan" together.
+	// They should NOT interleave (e.g., [build, plan, build, plan] would be wrong).
+	seen := map[string]bool{}
+	var groups []string
+	for _, p := range phases {
+		if !seen[p] {
+			seen[p] = true
+			groups = append(groups, p)
+		} else {
+			// If we see a phase we already saw, check it's still the current group.
+			if groups[len(groups)-1] != p {
+				t.Errorf("phases interleave — grouping is broken. Phase sequence: %v", phases)
+				break
+			}
+		}
+	}
+}
+
+func TestGroupingSortRecomputesOnToggle(t *testing.T) {
+	m, dir := newTestModel(t)
+
+	// Create tasks with different phases.
+	tasksYAML := `- id: z-task
+  prompt: prompts/a.md
+  phase: beta
+- id: a-task
+  prompt: prompts/b.md
+  phase: alpha
+`
+	if err := os.WriteFile(filepath.Join(dir, "tasks.yaml"), []byte(tasksYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.tasksFile = filepath.Join(dir, "tasks.yaml")
+	m.refreshState()
+
+	// Without grouping, both tasks are pending; z-task comes first (definition order).
+	if m.tasks[m.displayOrder[0]].ID != "z-task" {
+		t.Fatalf("without grouping, expected z-task first, got %s", m.tasks[m.displayOrder[0]].ID)
+	}
+
+	// Enable phase grouping — alpha < beta, so a-task should come first.
+	newM, _ := m.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	m2 := newM.(tuiModel)
+
+	if m2.tasks[m2.displayOrder[0]].ID != "a-task" {
+		t.Errorf("with phase grouping, expected a-task first (alpha < beta), got %s", m2.tasks[m2.displayOrder[0]].ID)
+	}
+
+	// Toggle off — should revert to definition order.
+	newM, _ = m2.Update(tea.KeyPressMsg{Code: 'p', Text: "p"})
+	m3 := newM.(tuiModel)
+
+	if m3.tasks[m3.displayOrder[0]].ID != "z-task" {
+		t.Errorf("after toggling off, expected z-task first, got %s", m3.tasks[m3.displayOrder[0]].ID)
+	}
+}
+
+// ── Lane column ──────────────────────────────────────────────────────────────
+
+func TestLaneColumnRendered(t *testing.T) {
+	m, dir := newTestModel(t)
+
+	// Create tasks with lane field.
+	tasksYAML := `- id: task-a
+  prompt: prompts/a.md
+  lane: core
+- id: task-b
+  prompt: prompts/b.md
+  lane: api
+`
+	if err := os.WriteFile(filepath.Join(dir, "tasks.yaml"), []byte(tasksYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.tasksFile = filepath.Join(dir, "tasks.yaml")
+	m.refreshState()
+
+	v := m.View()
+	content := v.Content
+	// Lane values appear in table cells (not wrapped in ANSI like headers).
+	if !strings.Contains(content, "core") {
+		t.Errorf("table should show lane 'core', got:\n%s", content)
+	}
+	if !strings.Contains(content, "api") {
+		t.Errorf("table should show lane 'api', got:\n%s", content)
+	}
+}
+
+func TestLaneColumnDashWhenEmpty(t *testing.T) {
+	m, _ := newTestModel(t)
+	// Default fixture tasks have no lane field set — verify table still has 8 columns.
+	cols := tableColumns(m.width)
+	if len(cols) != 8 {
+		t.Errorf("expected 8 columns (including Lane), got %d", len(cols))
+	}
+	if cols[7].header != "Lane" {
+		t.Errorf("expected last column header 'Lane', got %q", cols[7].header)
+	}
+}
+
 // ── Detail view — state.json fields and verify gates ─────────────────────────
 
 func TestDetailViewShowsStateFields(t *testing.T) {

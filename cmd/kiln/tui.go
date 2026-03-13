@@ -97,6 +97,21 @@ func statusOrder(s string) int {
 	}
 }
 
+// taskGroupKey returns the grouping key for a task at the given index.
+func (m *tuiModel) taskGroupKey(idx int) string {
+	if idx < 0 || idx >= len(m.tasks) {
+		return ""
+	}
+	switch m.grouping {
+	case groupByPhase:
+		return m.tasks[idx].Phase
+	case groupByMilestone:
+		return m.tasks[idx].Milestone
+	default:
+		return ""
+	}
+}
+
 // computeDisplayOrder builds m.displayOrder based on current statuses and grouping.
 func (m *tuiModel) computeDisplayOrder() {
 	n := len(m.statuses)
@@ -105,15 +120,35 @@ func (m *tuiModel) computeDisplayOrder() {
 		indices[i] = i
 	}
 	sort.SliceStable(indices, func(a, b int) bool {
-		sa := m.statuses[indices[a]]
-		sb := m.statuses[indices[b]]
+		ia := indices[a]
+		ib := indices[b]
+
+		// When grouping is active, sort by group key first so that
+		// tasks in the same group stay together.
+		if m.grouping != groupNone {
+			ga := m.taskGroupKey(ia)
+			gb := m.taskGroupKey(ib)
+			if ga != gb {
+				// Empty group key sorts last.
+				if ga == "" {
+					return false
+				}
+				if gb == "" {
+					return true
+				}
+				return ga < gb
+			}
+		}
+
+		sa := m.statuses[ia]
+		sb := m.statuses[ib]
 		oa := statusOrder(sa.Status)
 		ob := statusOrder(sb.Status)
 		if oa != ob {
 			return oa < ob
 		}
 		// Preserve original definition order within same status group.
-		return indices[a] < indices[b]
+		return ia < ib
 	})
 	m.displayOrder = indices
 }
@@ -263,6 +298,7 @@ func (m tuiModel) handleMainKey(key string) (tea.Model, tea.Cmd) {
 		} else {
 			m.grouping = groupByPhase
 		}
+		m.computeDisplayOrder()
 	case "m":
 		// Toggle milestone grouping.
 		if m.grouping == groupByMilestone {
@@ -270,6 +306,7 @@ func (m tuiModel) handleMainKey(key string) (tea.Model, tea.Cmd) {
 		} else {
 			m.grouping = groupByMilestone
 		}
+		m.computeDisplayOrder()
 	case "enter":
 		info := m.selectedStatusInfo()
 		if info != nil {
@@ -500,9 +537,10 @@ func tableColumns(w int) []colDef {
 	durationW := 10
 	kindW := 10
 	phaseW := 10
+	laneW := 10
 	errW := 38
 
-	idW := w - statusW - attemptsW - durationW - kindW - phaseW - errW - 7 // 7 spaces
+	idW := w - statusW - attemptsW - durationW - kindW - phaseW - laneW - errW - 8 // 8 spaces between 9 cols
 	if idW < 10 {
 		idW = 10
 	}
@@ -514,6 +552,7 @@ func tableColumns(w int) []colDef {
 		{"Duration", durationW},
 		{"Kind", kindW},
 		{"Phase", phaseW},
+		{"Lane", laneW},
 	}
 }
 
@@ -557,6 +596,10 @@ func (m tuiModel) renderRow(info taskStatusInfo, displayPos int, w int) string {
 	if phase == "" {
 		phase = "-"
 	}
+	lane := "-"
+	if task := m.taskByID(info.ID); task != nil && task.Lane != "" {
+		lane = task.Lane
+	}
 
 	cells := []string{
 		padOrTrunc(info.ID, cols[0].width),
@@ -566,6 +609,7 @@ func (m tuiModel) renderRow(info taskStatusInfo, displayPos int, w int) string {
 		padOrTrunc(dur, cols[4].width),
 		padOrTrunc(kind, cols[5].width),
 		padOrTrunc(phase, cols[6].width),
+		padOrTrunc(lane, cols[7].width),
 	}
 
 	// Apply status color to status cell.
