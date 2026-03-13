@@ -478,6 +478,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		return 0
+	case "tui":
+		return runTUI(args[1:])
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 1

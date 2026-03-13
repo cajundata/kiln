@@ -9,7 +9,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 $(KILN): cmd/kiln/main.go
 	@echo "kiln: rebuilding $(KILN) ($(VERSION))..."
-	@go build -ldflags "-X main.version=$(VERSION)" -o $(KILN) ./cmd/kiln
+	@go build -ldflags "-X main.version=$(VERSION)" -o ./bin/kiln ./cmd/kiln
 	@echo "kiln: build complete"
 
 # ---- Generated targets (conditionally included) ----
